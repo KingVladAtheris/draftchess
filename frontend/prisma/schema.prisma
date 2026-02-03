@@ -1,0 +1,71 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            Int       @id @default(autoincrement())
+  username      String    @unique
+  email         String    @unique
+  passwordHash  String
+  name          String?   // ← add (optional, for display)
+  emailVerified DateTime? // ← add (for future email verification)
+  image         String?   // ← add (for profile pic if you add OAuth later)
+  createdAt     DateTime  @default(now())
+  drafts        Draft[]
+  accounts      Account[]
+  sessions      Session[]
+}
+
+model Draft {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  name      String?
+  fen       String
+  points    Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) // or @updatedAt if you prefer auto-update
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            Int
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       Int
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
