@@ -1,6 +1,6 @@
 // src/app/drafts/[id]/page.tsx
 import { auth } from "@/auth";
-import prisma from "@/app/lib/prisma";
+import { prisma } from "@/app/lib/prisma.server";
 import { redirect } from "next/navigation";
 import ClientDraftEditor from "./ClientDraftEditor";
 

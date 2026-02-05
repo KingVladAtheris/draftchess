@@ -1,5 +1,5 @@
 // src/app/api/signup/route.ts
-import prisma from "@/app/lib/prisma";
+import { prisma } from "@/app/lib/prisma.server";
 import bcrypt from "bcrypt";
 
 export async function POST(request: Request) {

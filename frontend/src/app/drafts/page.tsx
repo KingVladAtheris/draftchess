@@ -1,6 +1,6 @@
 // src/app/drafts/page.tsx
 import { auth } from "@/auth";
-import prisma from "@/app/lib/prisma";
+import { prisma } from "@/app/lib/prisma.server";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";

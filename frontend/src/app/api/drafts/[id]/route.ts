@@ -1,6 +1,6 @@
 // src/app/api/drafts/[id]/route.ts
 import { auth } from "@/auth";
-import prisma from "@/app/lib/prisma";
+import { prisma } from "@/app/lib/prisma.server";
 import { NextResponse } from "next/server";
 
 export async function POST(
