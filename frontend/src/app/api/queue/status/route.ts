@@ -15,11 +15,6 @@ export async function GET() {
     where: { id: userId },
     select: {
       queueStatus: true,
-      currentGames: {
-        where: { status: { in: ["starting", "active"] } },
-        orderBy: { createdAt: "desc" },
-        take: 1,
-      },
     },
   });
 
@@ -27,7 +22,18 @@ export async function GET() {
     return NextResponse.json({ error: "User not found" }, { status: 404 });
   }
 
-  const currentGame = user.currentGames[0];
+  // Find the most recent game where user is a participant and game is active
+  const currentGame = await prisma.game.findFirst({
+    where: {
+      OR: [
+        { player1Id: userId },
+        { player2Id: userId },
+      ],
+      status: { in: ["prep", "active"] },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
   const isMatched = user.queueStatus === "in_game" && currentGame != null;
 
   return NextResponse.json({

@@ -1,10 +1,9 @@
 // app/play/game/[id]/page.tsx
-// This is a Server Component — no "use client" here
-
+// Updated to fetch additional game fields for prep phase
 import { auth } from "@/auth";
-import { prisma } from "@/app/lib/prisma.server";  // your server-only Prisma
+import { prisma } from "@/app/lib/prisma.server";  
 import { redirect } from "next/navigation";
-import ClientGameBoard from "./ClientGameBoard";  // import the client part
+import ClientGame from "./ClientGame";  
 
 interface GamePageProps {
   params: Promise<{ id: string }>;
@@ -43,17 +42,19 @@ export default async function GamePage({ params }: GamePageProps) {
     redirect("/play/select?error=not_participant");
   }
 
-  const initialFen = game.draft1?.fen ?? "start";
-
-  // Optionally determine board orientation (white/black perspective)
   const isWhite = game.player1Id === userId;
 
   return (
-    <ClientGameBoard
+    <ClientGame
       gameId={gameId}
-      initialFen={initialFen}
+      initialFen={game.fen ?? "start"}
       isWhite={isWhite}
-      // You can pass more props later (player usernames, opponent info, etc.)
+      initialStatus={game.status}
+      initialPrepStartedAt={game.prepStartedAt}
+      initialReadyPlayer1={game.readyPlayer1}
+      initialReadyPlayer2={game.readyPlayer2}
+      initialAuxPointsPlayer1={game.auxPointsPlayer1}
+      initialAuxPointsPlayer2={game.auxPointsPlayer2}
     />
   );
 }

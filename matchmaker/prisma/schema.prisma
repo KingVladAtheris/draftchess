@@ -47,6 +47,12 @@ model Game {
   draft2Id  Int?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
+  fen               String?   // combined + aux-modified FEN
+  prepStartedAt     DateTime?
+  readyPlayer1      Boolean   @default(false)
+  readyPlayer2      Boolean   @default(false)
+  auxPointsPlayer1  Int       @default(6)
+  auxPointsPlayer2  Int       @default(6)
   
   // Add field to track which user has this as current game (optional)
   currentForUserId Int?

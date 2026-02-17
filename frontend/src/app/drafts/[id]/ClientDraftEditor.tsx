@@ -1,4 +1,3 @@
-// src/app/drafts/[id]/ClientDraftEditor.tsx
 "use client";
 
 import { useState, useMemo } from "react";
@@ -8,15 +7,15 @@ import Link from "next/link";
 type LibraryPiece = {
   name: string;
   value: number;
-  fen: string; // uppercase: "P", "N", "B", "R", "Q", "K"
-  ui: string;  // "wP", "wN", etc.
+  fen: string;
+  ui: string;
 };
 
 type ClientDraftEditorProps = {
   initialFen: string;
   initialPoints: number;
   draftId: number;
-  initialName?: string; // optional – passed from server if exists
+  initialName?: string;
 };
 
 export default function ClientDraftEditor({
@@ -28,7 +27,7 @@ export default function ClientDraftEditor({
   const [position, setPosition] = useState(initialFen);
   const [pointsUsed, setPointsUsed] = useState(initialPoints);
   const [draftName, setDraftName] = useState(initialName);
-  const maxPoints = 36;
+  const maxPoints = 33;
 
   const [activePiece, setActivePiece] = useState<string | null>(null);
   const [draggedSquare, setDraggedSquare] = useState<string | null>(null);
@@ -46,11 +45,6 @@ export default function ClientDraftEditor({
     ],
     []
   );
-
-  // ────────────────────────────────────────────────
-  // Your existing FEN helpers, placePiece, removePiece, movePiece, etc.
-  // (keeping them unchanged – copy-paste your full helpers here)
-  // ────────────────────────────────────────────────
 
   const expandFenRow = (row: string): string => {
     let result = "";
@@ -82,12 +76,222 @@ export default function ClientDraftEditor({
     return result;
   };
 
+  const hasIllegalBattery = (pos?: string): boolean => {
+    const currentPos = pos || position;
+    const rows = currentPos.split(" ")[0].split("/");
+    const board = rows.map(expandFenRow);
+
+    for (let file = 0; file < 8; file++) {
+      const p1 = board[7][file];
+      const p2 = board[6][file];
+      if (p1 === "1" || p2 === "1") continue;
+      if ((p1 === "Q" || p1 === "R") && (p2 === "Q" || p2 === "R")) return true;
+    }
+
+    for (let file = 0; file < 7; file++) {
+      const pairs = [
+        [board[7][file], board[6][file + 1]],
+        [board[7][file + 1], board[6][file]],
+      ];
+      for (const [a, b] of pairs) {
+        if (a === "1" || b === "1") continue;
+        if ((a === "Q" || a === "B") && (b === "Q" || b === "B")) return true;
+      }
+    }
+
+    return false;
+  };
+
+  const getPieceAt = (square: string): string => {
+    const rank = parseInt(square[1], 10);
+    const file = square.charCodeAt(0) - 97;
+    const rankIndex = 8 - rank;
+    const row = expandFenRow(position.split(" ")[0].split("/")[rankIndex]);
+    return row[file];
+  };
+
+  const simulateMove = (from: string, to: string): string => {
+    const fenParts = position.split(" ");
+    const rows = fenParts[0].split("/");
+
+    const fromRank = parseInt(from[1], 10);
+    const fromFile = from.charCodeAt(0) - 97;
+    const toRank = parseInt(to[1], 10);
+    const toFile = to.charCodeAt(0) - 97;
+
+    const rankIndexFrom = 8 - fromRank;
+    const rankIndexTo = 8 - toRank;
+
+    let rowFrom = expandFenRow(rows[rankIndexFrom]);
+    const piece = rowFrom[fromFile];
+
+    rowFrom = rowFrom.substring(0, fromFile) + "1" + rowFrom.substring(fromFile + 1);
+    rows[rankIndexFrom] = compressFenRow(rowFrom);
+
+    let rowTo = expandFenRow(rows[rankIndexTo]);
+    rowTo = rowTo.substring(0, toFile) + piece + rowTo.substring(toFile + 1);
+    rows[rankIndexTo] = compressFenRow(rowTo);
+
+    return rows.join("/") + " w - - 0 1";
+  };
+
+  const simulatePlacement = (fenLetter: string, targetSquare: string): string => {
+    const rank = parseInt(targetSquare[1], 10);
+    const fileIndex = targetSquare.charCodeAt(0) - 97;
+    const fenParts = position.split(" ");
+    const rows = fenParts[0].split("/");
+    const rankIndex = 8 - rank;
+    let row = expandFenRow(rows[rankIndex]);
+    row = row.substring(0, fileIndex) + fenLetter + row.substring(fileIndex + 1);
+    rows[rankIndex] = compressFenRow(row);
+    return rows.join("/") + " w - - 0 1";
+  };
+
+  // ─── Shared square calculation for both drag and placement ───────────────
+
+  // Used when dragging an existing piece from the board
+  const calculateDragSquares = (from: string): { legal: string[], illegal: string[] } => {
+    const legal: string[] = [];
+    const illegal: string[] = [];
+    const piece = getPieceAt(from);
+
+    if (!piece || piece === "1") return { legal, illegal };
+
+    for (let r = 1; r <= 2; r++) {
+      for (let f = 0; f < 8; f++) {
+        const to = String.fromCharCode(97 + f) + r;
+        if (to === from) continue;
+
+        // Pawn restricted to rank 2
+        if (piece === "P" && r !== 2) {
+          illegal.push(to);
+          continue;
+        }
+
+        // King restricted to rank 1, files c-f
+        if (piece === "K" && (r !== 1 || !["c", "d", "e", "f"].includes(to[0]))) {
+          illegal.push(to);
+          continue;
+        }
+
+        // Occupied square
+        if (getPieceAt(to) !== "1") {
+          illegal.push(to);
+          continue;
+        }
+
+        // Battery check
+        const tempPos = simulateMove(from, to);
+        if (hasIllegalBattery(tempPos)) {
+          illegal.push(to);
+        } else {
+          legal.push(to);
+        }
+      }
+    }
+
+    return { legal, illegal };
+  };
+
+  // Used when a piece is selected from the sidebar for placement
+  const calculatePlacementSquares = (fenLetter: string): { legal: string[], illegal: string[] } => {
+    const legal: string[] = [];
+    const illegal: string[] = [];
+
+    for (let r = 1; r <= 2; r++) {
+      for (let f = 0; f < 8; f++) {
+        const sq = String.fromCharCode(97 + f) + r;
+
+        // Pawn restricted to rank 2
+        if (fenLetter === "P" && r !== 2) {
+          illegal.push(sq);
+          continue;
+        }
+
+        // King restricted to rank 1, files c-f
+        if (fenLetter === "K" && (r !== 1 || !["c", "d", "e", "f"].includes(sq[0]))) {
+          illegal.push(sq);
+          continue;
+        }
+
+        // Occupied square
+        if (getPieceAt(sq) !== "1") {
+          illegal.push(sq);
+          continue;
+        }
+
+        // Battery check
+        const tempPos = simulatePlacement(fenLetter, sq);
+        if (hasIllegalBattery(tempPos)) {
+          illegal.push(sq);
+        } else {
+          legal.push(sq);
+        }
+      }
+    }
+
+    return { legal, illegal };
+  };
+
+  // ─── Square style ────────────────────────────────────────────────────────
+
+  const customSquareStyles = useMemo(() => {
+    const styles: Record<string, React.CSSProperties> = {};
+
+    if (isDragging || activePiece) {
+      legalSquares.forEach(sq => {
+        styles[sq] = { backgroundColor: "rgba(0, 255, 0, 0.4)" };
+      });
+      illegalSquares.forEach(sq => {
+        styles[sq] = { backgroundColor: "rgba(255, 0, 0, 0.4)" };
+      });
+    }
+
+    return styles;
+  }, [isDragging, activePiece, legalSquares, illegalSquares]);
+
+  // ─── Drag handlers ───────────────────────────────────────────────────────
+
+  const handlePieceDrag = (args: any) => {
+    const square = args.square as string;
+
+    if (!isDragging) setIsDragging(true);
+
+    if (draggedSquare !== square) {
+      setDraggedSquare(square);
+      const { legal, illegal } = calculateDragSquares(square);
+      setLegalSquares(legal);
+      setIllegalSquares(illegal);
+    }
+  };
+
+  const handlePieceDrop = (args: any) => {
+    const sourceSquare = args.sourceSquare as string;
+    const targetSquare = args.targetSquare as string;
+
+    setIsDragging(false);
+    setDraggedSquare(null);
+    setLegalSquares([]);
+    setIllegalSquares([]);
+
+    if (!targetSquare) return false;
+
+    return movePiece(sourceSquare, targetSquare);
+  };
+
+  // ─── Piece operations ────────────────────────────────────────────────────
+
   const placePiece = (fenLetter: string, targetSquare: string, addPoints = true): boolean => {
     const rank = parseInt(targetSquare[1], 10);
     const fileIndex = targetSquare.charCodeAt(0) - 97;
 
     if (rank !== 1 && rank !== 2) {
       alert("Pieces can only be placed on ranks 1 or 2");
+      return false;
+    }
+
+    if (fenLetter === "P" && rank !== 2) {
+      alert("Pawns can only be placed on rank 2");
       return false;
     }
 
@@ -104,7 +308,7 @@ export default function ClientDraftEditor({
     }
 
     const selected = pieceLibrary.find((p) => p.fen === fenLetter) ||
-                     (fenLetter === "K" ? { name: "King", value: 0, fen: "K", ui: "wK" } : null);
+                    (fenLetter === "K" ? { name: "King", value: 0, fen: "K", ui: "wK" } : null);
     if (!selected) return false;
 
     if (addPoints && pointsUsed + selected.value > maxPoints) {
@@ -114,7 +318,6 @@ export default function ClientDraftEditor({
 
     const fenParts = position.split(" ");
     const rows = fenParts[0].split("/");
-
     const rankIndex = 8 - rank;
     let row = expandFenRow(rows[rankIndex]);
 
@@ -144,7 +347,6 @@ export default function ClientDraftEditor({
 
     const fenParts = position.split(" ");
     const rows = fenParts[0].split("/");
-
     const rankIndex = 8 - rank;
     let row = expandFenRow(rows[rankIndex]);
 
@@ -195,6 +397,12 @@ export default function ClientDraftEditor({
 
     if (piece === "1") return false;
 
+    // Pawn restricted to rank 2
+    if (piece === "P" && rankTo !== 2) {
+      alert("Pawns can only be on rank 2");
+      return false;
+    }
+
     if (piece === "K") {
       const file = to[0];
       if (rankTo !== 1 || !["c", "d", "e", "f"].includes(file)) {
@@ -227,159 +435,11 @@ export default function ClientDraftEditor({
     return true;
   };
 
-  const hasIllegalBattery = (pos?: string): boolean => {
-    const currentPos = pos || position;
-    const rows = currentPos.split(" ")[0].split("/");
+  // ─── Save ────────────────────────────────────────────────────────────────
 
-    const board = rows.map(expandFenRow);
-
-    for (let file = 0; file < 8; file++) {
-      const p1 = board[7][file];
-      const p2 = board[6][file];
-
-      if (p1 === "1" || p2 === "1") continue;
-
-      if ((p1 === "Q" || p1 === "R") && (p2 === "Q" || p2 === "R")) {
-        return true;
-      }
-    }
-
-    for (let file = 0; file < 7; file++) {
-      const pairs = [
-        [board[7][file], board[6][file + 1]],
-        [board[7][file + 1], board[6][file]],
-      ];
-
-      for (const [a, b] of pairs) {
-        if (a === "1" || b === "1") continue;
-
-        if ((a === "Q" || a === "B") && (b === "Q" || b === "B")) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  };
-
-  const getPieceAt = (square: string): string => {
-    const rank = parseInt(square[1], 10);
-    const file = square.charCodeAt(0) - 97;
-    const rankIndex = 8 - rank;
-    const row = expandFenRow(position.split(" ")[0].split("/")[rankIndex]);
-    return row[file];
-  };
-
-  const simulateMove = (from: string, to: string): string => {
-    const fenParts = position.split(" ");
-    const rows = fenParts[0].split("/");
-
-    const fromRank = parseInt(from[1], 10);
-    const fromFile = from.charCodeAt(0) - 97;
-    const toRank = parseInt(to[1], 10);
-    const toFile = to.charCodeAt(0) - 97;
-
-    const rankIndexFrom = 8 - fromRank;
-    const rankIndexTo = 8 - toRank;
-
-    let rowFrom = expandFenRow(rows[rankIndexFrom]);
-    const piece = rowFrom[fromFile];
-
-    rowFrom = rowFrom.substring(0, fromFile) + "1" + rowFrom.substring(fromFile + 1);
-    rows[rankIndexFrom] = compressFenRow(rowFrom);
-
-    let rowTo = expandFenRow(rows[rankIndexTo]);
-    rowTo = rowTo.substring(0, toFile) + piece + rowTo.substring(toFile + 1);
-    rows[rankIndexTo] = compressFenRow(rowTo);
-
-    return rows.join("/") + " w - - 0 1";
-  };
-
-  const calculateLegalAndIllegalSquares = (from: string): { legal: string[], illegal: string[] } => {
-    const legal: string[] = [];
-    const illegal: string[] = [];
-    const piece = getPieceAt(from);
-
-    if (!piece || piece === "1") return { legal, illegal };
-
-    for (let r = 1; r <= 2; r++) {
-      for (let f = 0; f < 8; f++) {
-        const to = String.fromCharCode(97 + f) + r;
-        if (to === from) continue;
-
-        if (getPieceAt(to) !== "1") {
-          illegal.push(to);
-          continue;
-        }
-
-        if (piece === "K" && (r !== 1 || !["c", "d", "e", "f"].includes(to[0]))) {
-          illegal.push(to);
-          continue;
-        }
-
-        const tempPos = simulateMove(from, to);
-        if (hasIllegalBattery(tempPos)) {
-          illegal.push(to);
-        } else {
-          legal.push(to);
-        }
-      }
-    }
-
-    return { legal, illegal };
-  };
-
-  const handlePieceDrag = (args: any) => {
-    const square = args.square as string;
-
-    if (!isDragging) {
-      setIsDragging(true);
-    }
-
-    if (draggedSquare !== square) {
-      setDraggedSquare(square);
-      const { legal, illegal } = calculateLegalAndIllegalSquares(square);
-      setLegalSquares(legal);
-      setIllegalSquares(illegal);
-    }
-  };
-
-  const customSquareStyles = useMemo(() => {
-    const styles: Record<string, React.CSSProperties> = {};
-
-    if (isDragging) {
-      legalSquares.forEach(sq => {
-        styles[sq] = { backgroundColor: "rgba(0, 255, 0, 0.4)" };
-      });
-      illegalSquares.forEach(sq => {
-        styles[sq] = { backgroundColor: "rgba(255, 0, 0, 0.4)" };
-      });
-    }
-
-    return styles;
-  }, [isDragging, legalSquares, illegalSquares]);
-
-  const handlePieceDrop = (args: any) => {
-    const sourceSquare = args.sourceSquare as string;
-    const targetSquare = args.targetSquare as string;
-
-    setIsDragging(false);
-    setDraggedSquare(null);
-    setLegalSquares([]);
-    setIllegalSquares([]);
-
-    if (!targetSquare) return false;
-
-    return movePiece(sourceSquare, targetSquare);
-  };
-
-  // ────────────────────────────────────────────────
-  // SAVE HANDLER
-  // ────────────────────────────────────────────────
   const handleSave = async () => {
     let finalName = draftName;
 
-    // If no name yet, prompt user
     if (!finalName.trim()) {
       const enteredName = prompt("Please enter a name for your draft:", "My New Army");
       if (!enteredName || !enteredName.trim()) {
@@ -401,9 +461,7 @@ export default function ClientDraftEditor({
         }),
       });
 
-      if (!res.ok) {
-        throw new Error("Save failed");
-      }
+      if (!res.ok) throw new Error("Save failed");
 
       alert("Draft saved successfully!");
     } catch (err) {
@@ -411,6 +469,8 @@ export default function ClientDraftEditor({
       alert("Failed to save draft. Please try again.");
     }
   };
+
+  // ─── Render ──────────────────────────────────────────────────────────────
 
   return (
     <div className="flex min-h-screen bg-gray-100">
@@ -426,7 +486,6 @@ export default function ClientDraftEditor({
           </Link>
         </div>
 
-        {/* Draft Name Display / Edit */}
         <div className="mb-6">
           <label className="block text-sm font-medium mb-1">Draft Name</label>
           <input
@@ -441,14 +500,25 @@ export default function ClientDraftEditor({
         <div className="space-y-4 flex-grow">
           {pieceLibrary.map((p) => (
             <div key={p.ui} className="flex justify-between items-center">
-              <span>
-                {p.name} ({p.value} pts)
-              </span>
+              <span>{p.name} ({p.value} pts)</span>
               <button
                 className={`px-3 py-1 rounded ${
                   activePiece === p.ui ? "bg-blue-500 text-white" : "bg-gray-200 hover:bg-gray-300"
                 }`}
-                onClick={() => setActivePiece(activePiece === p.ui ? null : p.ui)}
+                onClick={() => {
+                  if (activePiece === p.ui) {
+                    // Deselect - clear highlights
+                    setActivePiece(null);
+                    setLegalSquares([]);
+                    setIllegalSquares([]);
+                  } else {
+                    // Select - calculate placement squares
+                    setActivePiece(p.ui);
+                    const { legal, illegal } = calculatePlacementSquares(p.fen);
+                    setLegalSquares(legal);
+                    setIllegalSquares(illegal);
+                  }
+                }}
               >
                 {activePiece === p.ui ? "Cancel" : "Place"}
               </button>
@@ -486,7 +556,10 @@ export default function ClientDraftEditor({
                   const selected = pieceLibrary.find(p => p.ui === activePiece);
                   if (!selected) return;
                   placePiece(selected.fen, square);
+                  // Clear highlights after placement
                   setActivePiece(null);
+                  setLegalSquares([]);
+                  setIllegalSquares([]);
                 } else if (getPieceAt(square) !== "1") {
                   removePiece(square);
                 }
