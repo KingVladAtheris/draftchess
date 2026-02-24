@@ -1,3 +1,4 @@
+// src/app/drafts/[id]/ClientDraftEditor.tsx
 "use client";
 
 import { useState, useMemo } from "react";

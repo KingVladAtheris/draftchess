@@ -1,9 +1,9 @@
 // app/play/game/[id]/page.tsx
-// Updated to fetch additional game fields for prep phase
 import { auth } from "@/auth";
-import { prisma } from "@/app/lib/prisma.server";  
+import { prisma } from "@/app/lib/prisma.server";
 import { redirect } from "next/navigation";
-import ClientGame from "./ClientGame";  
+import ClientGame from "./ClientGame";
+import { buildCombinedDraftFen, maskOpponentAuxPlacements } from "@/app/lib/fen-utils";
 
 interface GamePageProps {
   params: Promise<{ id: string }>;
@@ -42,12 +42,24 @@ export default async function GamePage({ params }: GamePageProps) {
     redirect("/play/select?error=not_participant");
   }
 
-  const isWhite = game.player1Id === userId;
+  // isWhite is determined by whitePlayerId, NOT by player1Id.
+  // player1/player2 are matchmaking slots (queue order), color is assigned separately.
+  const isWhite = game.whitePlayerId === userId;
+
+  // Apply prep masking server-side so the initial render is already correct.
+  // This prevents the flash of the full (unmasked) FEN before the client's
+  // status fetch completes.
+  let initialFen = game.fen ?? "start";
+  if (game.status === "prep" && game.draft1?.fen && game.draft2?.fen) {
+    const originalFen = buildCombinedDraftFen(game.draft1.fen, game.draft2.fen);
+    initialFen = maskOpponentAuxPlacements(initialFen, originalFen, isWhite);
+  }
 
   return (
     <ClientGame
       gameId={gameId}
-      initialFen={game.fen ?? "start"}
+      myUserId={userId}
+      initialFen={initialFen}
       isWhite={isWhite}
       initialStatus={game.status}
       initialPrepStartedAt={game.prepStartedAt}
@@ -55,6 +67,8 @@ export default async function GamePage({ params }: GamePageProps) {
       initialReadyPlayer2={game.readyPlayer2}
       initialAuxPointsPlayer1={game.auxPointsPlayer1}
       initialAuxPointsPlayer2={game.auxPointsPlayer2}
+      player1Id={game.player1Id}
+      player2Id={game.player2Id}
     />
   );
 }

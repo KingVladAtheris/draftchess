@@ -1,7 +1,8 @@
 // src/app/play/select/SelectClient.tsx
-"use client";
+'use client';
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from 'react';
+import { getSocket } from '@/app/lib/socket';  // ← new import
 
 type DraftSelectItem = {
   id: number;
@@ -17,90 +18,95 @@ type SelectClientProps = {
 export default function SelectClient({ drafts }: SelectClientProps) {
   const [selectedDraftId, setSelectedDraftId] = useState<number | null>(null);
   const [isQueuing, setIsQueuing] = useState(false);
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [socketError, setSocketError] = useState<string | null>(null);
+
+  // Cleanup function for socket listeners
+  useEffect(() => {
+    return () => {
+      // Optional: leave queue room when unmounting / changing page
+      getSocket().then((socket) => {
+        socket.emit('leave-queue');
+      }).catch(() => {});
+    };
+  }, []);
 
   const handleSelect = (id: number) => {
     setSelectedDraftId(id);
-  };
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
   };
 
   const handleQueue = async () => {
     if (!selectedDraftId) return;
 
     setIsQueuing(true);
+    setSocketError(null);
 
     try {
-      const res = await fetch("/api/queue/join", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+      const res = await fetch('/api/queue/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ draftId: selectedDraftId }),
       });
 
       if (!res.ok) {
-        throw new Error("Failed to join queue");
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to join queue');
       }
 
-      // Start polling for match
-      pollIntervalRef.current = setInterval(async () => {
-        try {
-          const statusRes = await fetch("/api/queue/status");
-          const data = await statusRes.json();
+      // Now connect to WebSocket and join the queue room
+      const socket = await getSocket();
 
-          if (data.matched) {
-            stopPolling();
-            window.location.href = `/play/game/${data.gameId}`;
-          }
-        } catch (error) {
-          console.error("Error checking queue status:", error);
-        }
-      }, 3000);
+      // Optional: emit join-queue (server already has middleware to join 'queue' on connect,
+      // but explicit emit can be useful if you want per-user tracking)
+      socket.emit('join-queue');
 
-    } catch (err) {
-      console.error(err);
-      alert("Failed to join queue");
+      // Listen for match notification from matchmaker
+      socket.on('matched', (data: { gameId: number }) => {
+        console.log('Match found! Game ID:', data.gameId);
+        setIsQueuing(false);
+        window.location.href = `/play/game/${data.gameId}`;
+      });
+
+      // Optional: listen for errors from server (e.g. queue full, invalid draft)
+      socket.on('queue-error', (msg: string) => {
+        setSocketError(msg);
+        setIsQueuing(false);
+      });
+
+    } catch (err: any) {
+      console.error('Queue error:', err);
+      setSocketError(err.message || 'Something went wrong');
       setIsQueuing(false);
     }
   };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopPolling();
-    };
-  }, []);
-
-  const isQueueEnabled = selectedDraftId !== null && !isQueuing;
 
   return (
     <>
       {/* Queue Button */}
       <div className="mb-10 text-center">
         <button
-          disabled={!isQueueEnabled}
+          disabled={!selectedDraftId || isQueuing}
           onClick={handleQueue}
           className={`px-12 py-5 text-white text-2xl rounded-lg transition ${
-            isQueueEnabled
-              ? "bg-purple-600 hover:bg-purple-700"
-              : "bg-gray-400 cursor-not-allowed"
+            selectedDraftId && !isQueuing
+              ? 'bg-purple-600 hover:bg-purple-700'
+              : 'bg-gray-400 cursor-not-allowed'
           }`}
         >
-          {isQueuing ? "Searching for opponent..." : "Queue for Match"}
+          {isQueuing ? 'Searching for opponent...' : 'Queue for Match'}
         </button>
 
-        {isQueueEnabled && selectedDraftId && (
+        {socketError && (
+          <p className="mt-3 text-red-600">{socketError}</p>
+        )}
+
+        {isQueuing && selectedDraftId && (
           <p className="mt-3 text-purple-700 font-medium">
             Selected: {drafts.find((d) => d.id === selectedDraftId)?.name || `Draft #${selectedDraftId}`}
           </p>
         )}
       </div>
 
-      {/* Draft List */}
+      {/* Draft List – unchanged */}
       <div className="bg-white rounded-lg shadow p-6 max-h-[60vh] overflow-y-auto">
         {drafts.length === 0 ? (
           <p className="text-center text-gray-500 py-8">
@@ -110,21 +116,18 @@ export default function SelectClient({ drafts }: SelectClientProps) {
           <div className="grid gap-4 md:grid-cols-2">
             {drafts.map((draft) => {
               const isSelected = selectedDraftId === draft.id;
-
               return (
                 <div
                   key={draft.id}
                   onClick={() => handleSelect(draft.id)}
                   className={`p-6 border-2 rounded-lg transition cursor-pointer relative ${
                     isSelected
-                      ? "border-purple-600 bg-purple-50 shadow-lg"
-                      : "border-gray-200 hover:border-purple-400 hover:bg-gray-50"
+                      ? 'border-purple-600 bg-purple-50 shadow-lg'
+                      : 'border-gray-200 hover:border-purple-400 hover:bg-gray-50'
                   }`}
                 >
                   {isSelected && (
-                    <div className="absolute top-2 right-2 text-purple-600 text-2xl">
-                      ✓
-                    </div>
+                    <div className="absolute top-2 right-2 text-purple-600 text-2xl">✓</div>
                   )}
                   <h3 className="font-bold text-lg mb-2">
                     {draft.name || `Draft #${draft.id}`}
