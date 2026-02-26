@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { updateGameResult } from "@/app/lib/elo-update";
+import { cancelTimeoutJob } from "@/app/lib/queues";
 
 export async function POST(
   req: NextRequest,
@@ -58,6 +59,9 @@ export async function POST(
     // Game was already finished (race condition)
     return NextResponse.json({ error: "Game already finished" }, { status: 409 });
   }
+
+  // Cancel the pending timeout job — game is now finished
+  await cancelTimeoutJob(gameId);
 
   // Broadcast resignation to both players
   const emitToGame = (global as any).emitToGame;

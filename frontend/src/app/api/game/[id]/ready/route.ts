@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { buildCombinedDraftFen, maskOpponentAuxPlacements } from "@/app/lib/fen-utils";
+import { scheduleTimeoutJob, cancelPrepJob } from "@/app/lib/queues";
 
 export async function POST(
   req: NextRequest,
@@ -100,6 +101,14 @@ export async function POST(
         readyPlayer2: true,
       });
     }
+
+    // Schedule first move timeout and cancel the prep auto-start job
+    // (the prep job would be a no-op anyway due to the DB guard, but
+    //  removing it keeps the queue clean)
+    await Promise.all([
+      scheduleTimeoutJob(gameId, 60000, 60000, now, "w"),
+      cancelPrepJob(gameId),
+    ]);
 
     return NextResponse.json({
       success: true,

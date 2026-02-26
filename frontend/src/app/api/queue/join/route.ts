@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
+import { triggerMatchmaking } from "@/app/lib/queue-join";
 
 export async function POST(req: NextRequest) {
   const session = await auth();
@@ -35,9 +36,13 @@ export async function POST(req: NextRequest) {
         queueStatus: "queued",
         queuedAt: new Date(),
         queuedDraftId: draftId,
-        // currentGameId removed - no longer exists in schema
       },
     });
+
+    // Immediately wake the match-worker so pairing happens without delay.
+    // Non-fatal — if Redis is briefly unavailable the matchmaker will still
+    // find this player on its next startup seed check.
+    await triggerMatchmaking();
 
     return NextResponse.json({ success: true });
   } catch (err) {

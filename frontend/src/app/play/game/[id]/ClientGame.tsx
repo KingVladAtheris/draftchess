@@ -262,6 +262,30 @@ export default function ClientGame({
             socket.emit("join-game", gameId);
           }
         });
+
+        // game-snapshot: full state pushed by server after every join-game.
+        // On first connect this arrives just after the HTTP status fetch —
+        // applying it is harmless (same data). On reconnect this is what
+        // restores any state missed while the socket was down.
+        socket.on("game-snapshot", (data: any) => {
+          if (!mounted) return;
+          handleGameUpdate(data);
+          if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
+          if (data.lastMoveAt)    setLastMoveAt(new Date(data.lastMoveAt));
+          if (data.moveNumber    !== undefined) setMoveNumber(data.moveNumber);
+          if (data.player1Timebank !== undefined) setPlayer1Timebank(data.player1Timebank);
+          if (data.player2Timebank !== undefined) setPlayer2Timebank(data.player2Timebank);
+          if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
+          if (data.status === "finished" && data.endReason) {
+            setGameResult({
+              winnerId:        data.winnerId ?? null,
+              endReason:       data.endReason,
+              player1EloAfter: data.player1EloAfter,
+              player2EloAfter: data.player2EloAfter,
+              eloChange:       data.eloChange,
+            });
+          }
+        });
       } catch (err) {
         console.error("Init error:", err);
         if (mounted) setSocketError("Failed to connect to game server.");
@@ -275,6 +299,7 @@ export default function ClientGame({
       getSocket()
         .then((socket) => {
           socket.off("game-update");
+          socket.off("game-snapshot");
           socket.off("connect_error");
           socket.off("reconnect");
         })

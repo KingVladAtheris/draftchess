@@ -4,6 +4,7 @@ import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { Chess } from "chess.js";
 import { updateGameResult } from "@/app/lib/elo-update";
+import { scheduleTimeoutJob, cancelTimeoutJob } from "@/app/lib/queues";
 
 // Time control constants
 const MOVE_TIME_LIMIT     = 30000; // 30 seconds per move in ms
@@ -120,6 +121,8 @@ export async function POST(
 
       // updateGameResult returns null if game was already finished (race condition guard)
       if (result) {
+        // Cancel the BullMQ timeout job — game is now finished
+        await cancelTimeoutJob(gameId);
         const emitToGame = (global as any).emitToGame;
         if (emitToGame) {
           emitToGame(gameId, "game-update", {
@@ -249,6 +252,23 @@ export async function POST(
     }
 
     emitToGame(gameId, "game-update", basePayload);
+  }
+
+  // ─── Schedule / cancel timeout job ───────────────────────────────────────
+  if (newStatus === "finished") {
+    // Game over — cancel any pending timeout job
+    await cancelTimeoutJob(gameId);
+  } else {
+    // Schedule a new timeout job for the next player's move.
+    // This replaces the previous job atomically (same jobId).
+    const newChessTurn = new DraftChess(newFen).turn();
+    await scheduleTimeoutJob(
+      gameId,
+      player1TimebankUpdate,
+      player2TimebankUpdate,
+      now,
+      newChessTurn,
+    );
   }
 
   return NextResponse.json({
