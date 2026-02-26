@@ -1,5 +1,6 @@
 // matchmaker/index.js
 const { PrismaClient } = require('@prisma/client');
+const { createClient: createRedisClient } = require('redis');
 const { Pool } = require('pg');
 const { PrismaPg } = require('@prisma/adapter-pg');
 
@@ -15,6 +16,24 @@ const prisma = new PrismaClient({ adapter });
 
 const APP_URL = process.env.APP_URL || 'http://host.docker.internal:3000';
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET;
+const GAME_EVENTS_CHANNEL = 'draftchess:game-events';
+
+// Redis client for publishing game events directly to the frontend server.
+// This replaces the HTTP notify relay — no round-trip, no dependency on the
+// frontend's HTTP server being up at the exact moment of publish.
+let redisPublisher = null;
+
+async function initRedis() {
+  if (!process.env.REDIS_URL) {
+    console.warn('[Matchmaker] REDIS_URL not set — falling back to HTTP notify');
+    return;
+  }
+  redisPublisher = createRedisClient({ url: process.env.REDIS_URL });
+  redisPublisher.on('error', (err) => console.error('[Redis] error:', err));
+  redisPublisher.on('reconnecting', () => console.warn('[Redis] reconnecting...'));
+  await redisPublisher.connect();
+  console.log('[Redis] publisher connected');
+}
 
 console.log('Matchmaker initialized');
 
@@ -75,20 +94,34 @@ async function notifyMatch(gameId, userIds) {
 }
 
 async function notifyGameUpdate(gameId, payload) {
-  try {
-    const res = await fetch(`${APP_URL}/api/notify/game-update`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${NOTIFY_SECRET}`,
-      },
-      body: JSON.stringify({ gameId, payload }),
-    });
-    if (!res.ok) {
-      console.error(`notifyGameUpdate failed for game ${gameId}: ${await res.text()}`);
+  if (redisPublisher) {
+    try {
+      await redisPublisher.publish(GAME_EVENTS_CHANNEL, JSON.stringify({
+        type: 'game',
+        gameId,
+        event: 'game-update',
+        payload,
+      }));
+    } catch (err) {
+      console.error(`[Redis] publish failed for game ${gameId}:`, err.message);
     }
-  } catch (err) {
-    console.error(`notifyGameUpdate fetch error for game ${gameId}:`, err.message);
+  } else {
+    // Fallback: HTTP notify (used if Redis is unavailable)
+    try {
+      const res = await fetch(`${APP_URL}/api/notify/game-update`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${NOTIFY_SECRET}`,
+        },
+        body: JSON.stringify({ gameId, payload }),
+      });
+      if (!res.ok) {
+        console.error(`notifyGameUpdate HTTP fallback failed for game ${gameId}: ${await res.text()}`);
+      }
+    } catch (err) {
+      console.error(`notifyGameUpdate HTTP fallback error for game ${gameId}:`, err.message);
+    }
   }
 }
 
@@ -273,7 +306,9 @@ async function runMatchmaker() {
   }
 }
 
-runMatchmaker().catch(err => {
-  console.error('Fatal matchmaker crash:', err);
-  process.exit(1);
-});
+initRedis()
+  .then(() => runMatchmaker())
+  .catch(err => {
+    console.error('Fatal matchmaker crash:', err);
+    process.exit(1);
+  });
