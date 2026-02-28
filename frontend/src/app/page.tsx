@@ -1,9 +1,27 @@
 // src/app/page.tsx
-import { auth } from "@/auth";  // your auth export from auth.ts
+import { auth } from "@/auth";
+import { prisma } from "@/app/lib/prisma.server";
+import { redirect } from "next/navigation";
 import Link from "next/link";
 
 export default async function Home() {
   const session = await auth();
+
+  // If the user is logged in and has an active or prep game, send them straight to it.
+  // Handles the case where they navigated away or reconnected to the home page mid-game.
+  if (session?.user?.id) {
+    const userId = parseInt(session.user.id);
+    const activeGame = await prisma.game.findFirst({
+      where: {
+        status: { in: ["active", "prep"] },
+        OR: [{ player1Id: userId }, { player2Id: userId }],
+      },
+      select: { id: true },
+    });
+    if (activeGame) {
+      redirect(`/play/game/${activeGame.id}`);
+    }
+  }
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center bg-gray-100 p-8">
