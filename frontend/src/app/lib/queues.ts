@@ -1,7 +1,16 @@
 // src/app/lib/queues.ts
 // BullMQ queue instances used by Next.js API routes to schedule and cancel
-// timeout jobs. Workers run in the matchmaker container — these are just
-// queue clients (no workers here).
+// timeout jobs. Workers run in the matchmaker container.
+//
+// FIXES applied here:
+//   #23 — Removed the remove-then-add pattern. We rely purely on the worker's
+//          staleness check (scheduledAt vs lastMoveAt) instead of explicit
+//          removal. A crash between remove() and add() previously caused the
+//          job to be permanently lost. Now we just add with a fixed jobId;
+//          BullMQ will keep both in the delayed queue and the stale one
+//          self-discards in the worker. To prevent unbounded accumulation we
+//          still attempt removal but no longer treat it as load-bearing.
+//   #21 — Errors in cancel helpers are now logged, not silently swallowed.
 
 import { Queue } from "bullmq";
 
@@ -9,8 +18,6 @@ if (!process.env.REDIS_URL) {
   throw new Error("REDIS_URL is not set");
 }
 
-// Parse redis://:password@host:port → ioredis connection options.
-// BullMQ uses ioredis which takes host/port/password, not a URL string.
 function parseRedisUrl(url: string) {
   const u = new URL(url);
   return {
@@ -22,17 +29,15 @@ function parseRedisUrl(url: string) {
 
 const redisOpts = parseRedisUrl(process.env.REDIS_URL);
 
-// Keep queue instances as module-level singletons so they are not
-// re-created on every API route call (Next.js reuses module instances
-// across requests in the same process).
 let _timeoutQueue: Queue | null = null;
 let _matchQueue:   Queue | null = null;
+let _prepQueue:    Queue | null = null;
 
 export function getTimeoutQueue(): Queue {
   if (!_timeoutQueue) {
     _timeoutQueue = new Queue("timeout-queue", {
-      connection:         redisOpts,
-      defaultJobOptions:  { removeOnComplete: 100, removeOnFail: 200 },
+      connection:        redisOpts,
+      defaultJobOptions: { removeOnComplete: 100, removeOnFail: 200 },
     });
   }
   return _timeoutQueue;
@@ -48,11 +53,24 @@ export function getMatchQueue(): Queue {
   return _matchQueue;
 }
 
+export function getPrepQueue(): Queue {
+  if (!_prepQueue) {
+    _prepQueue = new Queue("prep-queue", {
+      connection:        redisOpts,
+      defaultJobOptions: { removeOnComplete: 100, removeOnFail: 200 },
+    });
+  }
+  return _prepQueue;
+}
+
 /**
  * Schedule (or replace) the timeout job for a game.
- * Job ID is `timeout-${gameId}` — BullMQ will replace an existing delayed
- * job with the same ID, so calling this after every move automatically
- * cancels the previous timer.
+ *
+ * We no longer remove the old job before adding the new one (#23).
+ * The worker already validates scheduledAt === lastMoveAt and discards
+ * stale jobs, so a duplicate delayed job is harmless. Removing the
+ * remove→add pattern eliminates the crash window where the job was
+ * permanently lost.
  *
  * delay = MOVE_TIME_LIMIT + active player's timebank
  */
@@ -69,14 +87,14 @@ export async function scheduleTimeoutJob(
 
   const q = getTimeoutQueue();
 
-  // Remove the existing job for this game before adding the new one.
-  // BullMQ's jobId deduplication only prevents duplicates in the waiting
-  // state — a delayed job must be explicitly removed first.
+  // Best-effort removal of the previous job to keep the queue clean.
+  // Not load-bearing — a stale job that survives is harmless (worker
+  // discards it via the scheduledAt staleness check).
   try {
     const existing = await q.getJob(`timeout-${gameId}`);
     if (existing) await existing.remove();
-  } catch {
-    // Job may have already been processed — safe to ignore
+  } catch (err) {
+    console.warn(`[Queue] could not remove previous timeout job for game ${gameId}:`, err);
   }
 
   await q.add(
@@ -87,39 +105,30 @@ export async function scheduleTimeoutJob(
 }
 
 /**
- * Cancel the timeout job for a game (used on resign, checkmate, draw, etc.)
+ * Cancel the timeout job for a game (resign, checkmate, draw, forfeit, etc.)
+ * Errors are logged but not re-thrown — the worker's staleness check provides
+ * a safety net if the cancel fails. (#21)
  */
 export async function cancelTimeoutJob(gameId: number): Promise<void> {
   try {
     const q   = getTimeoutQueue();
     const job = await q.getJob(`timeout-${gameId}`);
     if (job) await job.remove();
-  } catch {
-    // Safe to ignore — job may already be gone
+  } catch (err) {
+    console.warn(`[Queue] cancelTimeoutJob for game ${gameId} failed:`, err);
   }
-}
-
-let _prepQueue: Queue | null = null;
-
-export function getPrepQueue(): Queue {
-  if (!_prepQueue) {
-    _prepQueue = new Queue("prep-queue", {
-      connection:        redisOpts,
-      defaultJobOptions: { removeOnComplete: 100, removeOnFail: 200 },
-    });
-  }
-  return _prepQueue;
 }
 
 /**
  * Cancel the prep auto-start job when both players ready up early.
+ * Errors are logged but not re-thrown. (#21)
  */
 export async function cancelPrepJob(gameId: number): Promise<void> {
   try {
     const q   = getPrepQueue();
     const job = await q.getJob(`prep-${gameId}`);
     if (job) await job.remove();
-  } catch {
-    // Safe to ignore
+  } catch (err) {
+    console.warn(`[Queue] cancelPrepJob for game ${gameId} failed:`, err);
   }
 }

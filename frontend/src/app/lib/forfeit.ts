@@ -1,18 +1,23 @@
 // src/app/lib/forfeit.ts
 // Handles game forfeit due to disconnect timeout.
-// Called from server.ts when a presence key expires in Redis.
-// Same outcome as resignation — opponent wins, ELO updated, socket event emitted.
+//
+// NOTE on race safety (#2):
+// The prep→active promotion here (updateMany prep→active) races with the
+// ready route. Both use updateMany guards, so only one can win. After
+// promotion, we call updateGameResult which is now fully transactional —
+// if the ready route also triggered updateGameResult, the second caller's
+// transaction sees status='finished' and returns null cleanly.
 
 import { prisma } from "@/app/lib/prisma.server";
 import { updateGameResult } from "@/app/lib/elo-update";
 import { cancelTimeoutJob } from "@/app/lib/queues";
 
 export async function forfeitGame(
-  gameId:  number,
-  userId:  number,  // the player who disconnected
+  gameId:     number,
+  userId:     number,
   emitToGame: (gameId: number, event: string, payload: any) => void
 ): Promise<void> {
-  // Load the game — must be active and the user must be a participant
+
   const game = await prisma.game.findUnique({
     where:  { id: gameId },
     select: {
@@ -31,7 +36,7 @@ export async function forfeitGame(
     return;
   }
 
-  if (game.status !== 'active' && game.status !== 'prep') {
+  if (game.status !== "active" && game.status !== "prep") {
     console.log(`[Forfeit] game ${gameId} already finished (status: ${game.status}), skipping`);
     return;
   }
@@ -42,14 +47,12 @@ export async function forfeitGame(
     return;
   }
 
-  // Both prep and active: full ELO update via updateGameResult.
-  // updateGameResult guards on status = 'active', so for prep games we
-  // manually transition to active first so the guard passes, then let
-  // updateGameResult handle the rest atomically.
-  if (game.status === 'prep') {
+  // For prep games, promote to active so updateGameResult's guard can fire.
+  // updateMany is atomic — if the ready route beat us here, count=0 and we exit.
+  if (game.status === "prep") {
     const promoted = await prisma.game.updateMany({
-      where: { id: gameId, status: 'prep' },
-      data:  { status: 'active' },
+      where: { id: gameId, status: "prep" },
+      data:  { status: "active" },
     });
     if (promoted.count === 0) {
       console.log(`[Forfeit] game ${gameId} prep already resolved, skipping`);
@@ -68,32 +71,28 @@ export async function forfeitGame(
     game.player2EloBefore ?? 1200,
     game.player1.gamesPlayed,
     game.player2.gamesPlayed,
-    'abandoned'
+    "abandoned"
   );
 
   if (!result) {
-    // Race condition — game was already finished by another path (timeout, move, etc.)
+    // updateGameResult's transaction saw status != 'active' — another path
+    // (timeout, move) already finished the game. queueStatus was reset there.
     console.log(`[Forfeit] game ${gameId} already finished by another path, skipping`);
     return;
   }
 
-  // Cancel the BullMQ timeout job — forfeit supersedes it
+  // updateGameResult already reset queueStatus for both players (#3).
+  // cancelTimeoutJob is idempotent — safe to call even if already cancelled.
   await cancelTimeoutJob(gameId);
 
-  // Reset both players out of in_game so they can queue again
-  await prisma.user.updateMany({
-    where: { id: { in: [game.player1Id, game.player2Id] } },
-    data:  { queueStatus: 'offline' },
-  });
-
-  emitToGame(gameId, 'game-update', {
-    status:          'finished',
+  emitToGame(gameId, "game-update", {
+    status:          "finished",
     winnerId,
-    endReason:       'abandoned',
+    endReason:       "abandoned",
     player1EloAfter: result.newPlayer1Elo,
     player2EloAfter: result.newPlayer2Elo,
     eloChange:       result.eloChange,
   });
 
-  console.log(`[Forfeit] game ${gameId}: user ${userId} forfeited (was ${game.status}), winner: ${winnerId}`);
+  console.log(`[Forfeit] game ${gameId}: user ${userId} forfeited, winner: ${winnerId}`);
 }

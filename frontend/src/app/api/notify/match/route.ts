@@ -1,9 +1,12 @@
 // src/app/api/notify/match/route.ts
+//
+// FIX #14: Secret comparison uses crypto.timingSafeEqual to prevent
+// timing-based side-channel attacks on the bearer token.
+
 import { NextResponse } from 'next/server';
+import { timingSafeEqual } from 'crypto';
 
-// Secret key to prevent unauthorized calls (set in .env)
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET;
-
 if (!NOTIFY_SECRET) {
   console.error('NOTIFY_SECRET not set in environment!');
 }
@@ -11,7 +14,17 @@ if (!NOTIFY_SECRET) {
 export async function POST(request: Request) {
   try {
     const authHeader = request.headers.get('authorization');
-    if (!authHeader || authHeader !== `Bearer ${NOTIFY_SECRET}`) {
+
+    // #14: timing-safe comparison
+    const isAuthorized = (() => {
+      if (!authHeader || !NOTIFY_SECRET) return false;
+      const expected = Buffer.from(`Bearer ${NOTIFY_SECRET}`);
+      const provided = Buffer.from(authHeader);
+      // Lengths must match before timingSafeEqual (it throws if they differ)
+      return expected.length === provided.length && timingSafeEqual(expected, provided);
+    })();
+
+    if (!isAuthorized) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
@@ -32,7 +45,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Server error' }, { status: 500 });
     }
 
-    // Targeted emit: only to the two matched players' personal queue rooms
     userIds.forEach((userId: number) => {
       const room = `queue-user-${userId}`;
       io.to(room).emit('matched', { gameId });

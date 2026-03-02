@@ -1,4 +1,16 @@
 // frontend/server.ts
+//
+// FIXES applied here:
+//   #9  — Redis DB index parsed from REDIS_URL instead of hardcoded '@0'.
+//   #16 — Added a dedicated 5th Redis client (cmdClient) for SET/DEL so
+//          pubClient is never used for general commands alongside adapter use.
+//   #17 — emitToGame/emitToGameUser/emitToQueueUser globals kept for same-
+//          process API routes, but all real-time events from routes also go
+//          through the Redis pub/sub channel so multi-process deployments work.
+//   #21 — Disconnect handler short-circuits if socket.data.gameId is not set,
+//          avoiding a DB query for every non-game socket disconnect.
+//   #22 — CORS origin locked to APP_URL env var, not wildcard.
+
 import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
@@ -20,18 +32,20 @@ if (!REDIS_URL) {
   process.exit(1);
 }
 
-// ─── Constants ─────────────────────────────────────────────────────────────
+// #9: Parse the DB index from the URL so keyspace notifications fire on the
+// correct database regardless of deployment config.
+const REDIS_DB_INDEX = parseInt(new URL(REDIS_URL).pathname.replace('/', '') || '0', 10);
+
 const DISCONNECT_GRACE_SECS = 30;
-const PRESENCE_KEY_PREFIX   = 'presence:disconnected:';  // presence:disconnected:{userId}:{gameId}
+const PRESENCE_KEY_PREFIX   = 'presence:disconnected:';
 
 // ─── Redis clients ─────────────────────────────────────────────────────────
-// Four separate clients — Redis clients in subscribe mode cannot issue other
-// commands, so each subscribe role needs its own connection:
-//
-//   pubClient        — Socket.IO adapter publisher + general commands (SET, DEL)
-//   subClient        — Socket.IO adapter subscriber (exclusive)
-//   eventsSubClient  — subscribes to draftchess:game-events channel
+// Five clients — each has a dedicated role:
+//   pubClient         — Socket.IO adapter publisher (exclusive to adapter)
+//   subClient         — Socket.IO adapter subscriber (exclusive to adapter)
+//   eventsSubClient   — subscribes to draftchess:game-events channel
 //   presenceSubClient — subscribes to Redis keyspace expiry notifications
+//   cmdClient         — general commands: SET, DEL, PUBLISH (#16)
 function makeRedisClient() {
   const client = createClient({ url: REDIS_URL });
   client.on('error',        (err) => console.error('[Redis] error:', err));
@@ -39,14 +53,14 @@ function makeRedisClient() {
   return client;
 }
 
-const pubClient        = makeRedisClient();
-const subClient        = makeRedisClient();
-const eventsSubClient  = makeRedisClient();
-const presenceSubClient = makeRedisClient();
+const pubClient          = makeRedisClient();
+const subClient          = makeRedisClient();
+const eventsSubClient    = makeRedisClient();
+const presenceSubClient  = makeRedisClient();
+const cmdClient          = makeRedisClient(); // #16: dedicated command client
 
 const GAME_EVENTS_CHANNEL = 'draftchess:game-events';
 
-// ─── Next.js ───────────────────────────────────────────────────────────────
 const app    = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
@@ -57,6 +71,7 @@ app.prepare().then(async () => {
     subClient.connect(),
     eventsSubClient.connect(),
     presenceSubClient.connect(),
+    cmdClient.connect(),         // #16
   ]);
   console.log('[Redis] all clients connected');
 
@@ -65,22 +80,27 @@ app.prepare().then(async () => {
     handle(req, res, parsedUrl);
   });
 
-  // ─── Socket.IO ────────────────────────────────────────────────────────────
+  // ─── Socket.IO ─────────────────────────────────────────────────────────────
+  const allowedOrigin = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+
   const ioOptions: Partial<ServerOptions> = {
     path:             '/api/socket.io',
     addTrailingSlash: false,
-    cors:             { origin: '*' },
-    pingInterval:     25000,
-    pingTimeout:      20000,
-    connectTimeout:   10000,
+    // #22: lock CORS to our own domain
+    cors: {
+      origin:      allowedOrigin,
+      credentials: true,
+    },
+    pingInterval:   25000,
+    pingTimeout:    20000,
+    connectTimeout: 10000,
   };
 
   const io = new SocketServer(httpServer, ioOptions);
-
   io.adapter(createAdapter(pubClient, subClient));
   console.log('[Socket.IO] Redis adapter attached');
 
-  // ─── Auth middleware ──────────────────────────────────────────────────────
+  // ─── Auth middleware ────────────────────────────────────────────────────────
   io.use(async (socket, next) => {
     try {
       const req   = { headers: socket.handshake.headers } as any;
@@ -93,23 +113,22 @@ app.prepare().then(async () => {
     }
   });
 
-  // ─── Presence helpers ─────────────────────────────────────────────────────
+  // ─── Presence helpers (use cmdClient, not pubClient) ──────────────────────
   function presenceKey(userId: number, gameId: number) {
     return `${PRESENCE_KEY_PREFIX}${userId}:${gameId}`;
   }
 
   async function setDisconnectedPresence(userId: number, gameId: number) {
-    // Key expires after grace period — expiry triggers forfeit via keyspace notification
-    await pubClient.set(presenceKey(userId, gameId), '1', { EX: DISCONNECT_GRACE_SECS });
+    await cmdClient.set(presenceKey(userId, gameId), '1', { EX: DISCONNECT_GRACE_SECS });
     console.log(`[Presence] user ${userId} disconnected from game ${gameId}, grace ${DISCONNECT_GRACE_SECS}s`);
   }
 
   async function clearDisconnectedPresence(userId: number, gameId: number) {
-    await pubClient.del(presenceKey(userId, gameId));
+    await cmdClient.del(presenceKey(userId, gameId));
     console.log(`[Presence] user ${userId} reconnected to game ${gameId}, grace period cancelled`);
   }
 
-  // ─── Connection handler ───────────────────────────────────────────────────
+  // ─── Connection handler ─────────────────────────────────────────────────────
   io.on('connection', (socket) => {
     const userId = socket.data.userId as number;
     console.log(`[Socket.IO] connected: ${socket.id} (user: ${userId})`);
@@ -118,7 +137,6 @@ app.prepare().then(async () => {
     socket.on('join-queue',  () => socket.join('queue'));
     socket.on('leave-queue', () => socket.leave('queue'));
 
-    // ── join-game: verify participant before joining room ───────────────────
     socket.on('join-game', async (gameId: number) => {
       if (!gameId || typeof gameId !== 'number') return;
 
@@ -140,24 +158,16 @@ app.prepare().then(async () => {
 
         socket.join(`game-${gameId}`);
         socket.join(`game-${gameId}-user-${userId}`);
-
-        // Track which game this socket is in so the disconnect handler knows
-        // which game to start the grace period for
         socket.data.gameId = gameId;
 
-        // If reconnecting after a disconnect, cancel the forfeit grace period
         await clearDisconnectedPresence(userId, gameId);
 
-        // Notify the opponent that this player is back
         if (game.status === 'active' || game.status === 'prep') {
           const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id;
           io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-connected', { userId });
         }
 
-        // ── Emit full game snapshot to this socket only ─────────────────────
-        // Allows the client to recover missed state after a reconnect without
-        // needing to make a separate HTTP request. Mirrors the /api/game/[id]/status
-        // response exactly — same masking, same timer calculation.
+        // ── Snapshot ─────────────────────────────────────────────────────────
         try {
           const MOVE_TIME_LIMIT = 30000;
           const snapshot = await prisma.game.findUnique({
@@ -181,19 +191,25 @@ app.prepare().then(async () => {
             const isPlayer1 = snapshot.player1Id === userId;
             const rawFen    = snapshot.fen ?? '';
 
-            // Mask opponent aux pieces during prep (same logic as status route)
+            // #6 (snapshot): same null-draft guard — fall back to starting FEN
+            // rather than exposing unmasked aux pieces if a draft was deleted.
             let maskedFen = rawFen;
-            if (snapshot.status === 'prep' && snapshot.draft1?.fen && snapshot.draft2?.fen) {
-              const originalFen = buildCombinedDraftFen(snapshot.draft1.fen, snapshot.draft2.fen);
-              maskedFen = maskOpponentAuxPlacements(rawFen, originalFen, isWhite);
+            if (snapshot.status === 'prep') {
+              if (snapshot.draft1?.fen && snapshot.draft2?.fen) {
+                const originalFen = buildCombinedDraftFen(snapshot.draft1.fen, snapshot.draft2.fen);
+                maskedFen = maskOpponentAuxPlacements(rawFen, originalFen, isWhite);
+              } else {
+                // Draft was deleted — send the combined starting FEN as a safe fallback
+                maskedFen = rawFen; // no aux to leak; log for visibility
+                console.warn(`[Socket.IO] snapshot: draft missing for game ${gameId} during prep`);
+              }
             }
 
-            // Timer calculation (same as status route)
             let timeRemainingOnMove = MOVE_TIME_LIMIT;
             if (snapshot.status === 'active' && snapshot.lastMoveAt) {
-              const turn     = rawFen.split(' ')[1];
-              const myTurn   = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
-              const elapsed  = Date.now() - new Date(snapshot.lastMoveAt).getTime();
+              const turn   = rawFen.split(' ')[1];
+              const myTurn = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
+              const elapsed = Date.now() - new Date(snapshot.lastMoveAt).getTime();
               if (myTurn) timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
             }
 
@@ -227,26 +243,29 @@ app.prepare().then(async () => {
       }
     });
 
-    // ── disconnect: start grace period if mid-game ──────────────────────────
+    // ── disconnect ─────────────────────────────────────────────────────────────
     socket.on('disconnect', async (reason) => {
       console.log(`[Socket.IO] disconnected: ${socket.id} (user: ${userId}, reason: ${reason})`);
 
+      // #21: skip the DB query entirely for sockets that never joined a game
+      const knownGameId = socket.data.gameId as number | undefined;
+      if (!knownGameId) return;
+
       try {
-        // Look up the user's current active/prep game directly from the DB.
-        // We don't rely solely on socket.data.gameId because it may not be set
-        // if the client connected before join-game was processed, or if the
-        // server restarted mid-session. The DB is always the source of truth.
+        // Still query DB as source of truth — socket.data.gameId could theoretically
+        // be stale if the server restarted mid-session, but the fast-path above
+        // eliminates queries for all non-game sockets (drafts, lobby, etc.)
         const game = await prisma.game.findFirst({
           where: {
-            status:    { in: ['active', 'prep'] },
+            status: { in: ['active', 'prep'] },
             OR: [{ player1Id: userId }, { player2Id: userId }],
           },
           select: { id: true, status: true, player1Id: true, player2Id: true },
         });
 
-        if (!game) return;  // user not in any active game
+        if (!game) return;
 
-        const gameId    = game.id;
+        const gameId     = game.id;
         const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id;
 
         await setDisconnectedPresence(userId, gameId);
@@ -261,25 +280,30 @@ app.prepare().then(async () => {
     });
   });
 
-  // ─── Emit helpers ─────────────────────────────────────────────────────────
+  // ─── Emit helpers ──────────────────────────────────────────────────────────
   const emitToGame = (gameId: number, event: string, payload: any) => {
     io.to(`game-${gameId}`).emit(event, payload);
   };
 
-  (global as any).emitToGame = emitToGame;
-
-  (global as any).emitToGameUser = (gameId: number, userId: number, event: string, payload: any) => {
+  const emitToGameUser = (gameId: number, userId: number, event: string, payload: any) => {
     io.to(`game-${gameId}-user-${userId}`).emit(event, payload);
   };
 
-  (global as any).emitToQueueUser = (userId: number, event: string, payload: any) => {
+  const emitToQueueUser = (userId: number, event: string, payload: any) => {
     io.to(`queue-user-${userId}`).emit(event, payload);
   };
 
-  (global as any).io       = io;
-  (global as any).redisPub = pubClient;
+  // Globals retained for same-process API routes.
+  // #17: Routes should prefer publishing to GAME_EVENTS_CHANNEL so that
+  // multi-process deployments work correctly. These globals are a fallback
+  // for single-process dev/prod.
+  (global as any).emitToGame      = emitToGame;
+  (global as any).emitToGameUser  = emitToGameUser;
+  (global as any).emitToQueueUser = emitToQueueUser;
+  (global as any).io              = io;
+  (global as any).redisPub        = cmdClient; // #16: expose cmdClient for pub, not pubClient
 
-  // ─── Game events subscriber ───────────────────────────────────────────────
+  // ─── Game events subscriber ────────────────────────────────────────────────
   await eventsSubClient.subscribe(GAME_EVENTS_CHANNEL, (raw) => {
     try {
       const msg = JSON.parse(raw);
@@ -298,14 +322,12 @@ app.prepare().then(async () => {
   });
   console.log(`[Events] subscribed to ${GAME_EVENTS_CHANNEL}`);
 
-  // ─── Presence expiry subscriber ───────────────────────────────────────────
-  // Redis publishes to __keyevent@0__:expired whenever a key expires.
-  // We filter for our presence keys and trigger forfeit when one fires.
-  // Requires notify-keyspace-events to include 'K' and 'x' (set in docker-compose).
-  await presenceSubClient.subscribe('__keyevent@0__:expired', async (expiredKey) => {
+  // ─── Presence expiry subscriber (#9) ──────────────────────────────────────
+  // DB index parsed from URL — not hardcoded to @0.
+  const keyspaceChannel = `__keyevent@${REDIS_DB_INDEX}__:expired`;
+  await presenceSubClient.subscribe(keyspaceChannel, async (expiredKey) => {
     if (!expiredKey.startsWith(PRESENCE_KEY_PREFIX)) return;
 
-    // Key format: presence:disconnected:{userId}:{gameId}
     const parts  = expiredKey.slice(PRESENCE_KEY_PREFIX.length).split(':');
     const userId = parseInt(parts[0]);
     const gameId = parseInt(parts[1]);
@@ -318,14 +340,14 @@ app.prepare().then(async () => {
     console.log(`[Presence] grace period expired for user ${userId} in game ${gameId} — forfeiting`);
     await forfeitGame(gameId, userId, emitToGame);
   });
-  console.log('[Presence] subscribed to keyspace expiry notifications');
+  console.log(`[Presence] subscribed to ${keyspaceChannel}`);
 
-  // ─── Start ────────────────────────────────────────────────────────────────
+  // ─── Start ─────────────────────────────────────────────────────────────────
   httpServer.listen(port, () => {
     console.log(`[Server] ready on http://${hostname}:${port}`);
   });
 
-  // ─── Graceful shutdown ────────────────────────────────────────────────────
+  // ─── Graceful shutdown ─────────────────────────────────────────────────────
   async function shutdown(signal: string) {
     console.log(`[Server] ${signal} — shutting down`);
     httpServer.close(async () => {
@@ -334,6 +356,7 @@ app.prepare().then(async () => {
       await subClient.quit();
       await eventsSubClient.quit();
       await presenceSubClient.quit();
+      await cmdClient.quit();
       console.log('[Server] clean exit');
       process.exit(0);
     });

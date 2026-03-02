@@ -1,4 +1,11 @@
 // app/api/game/[id]/place/route.ts
+//
+// FIX #4: Aux point deduction now uses a conditional updateMany with a
+// gte check on the point balance. Two concurrent requests for the same
+// player will both pass the JS-level validation (reading the same value),
+// but only one can win the DB-level race. The second sees count=0 and
+// returns 409.
+
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
@@ -12,7 +19,6 @@ import {
   maskOpponentAuxPlacements,
 } from "@/app/lib/fen-utils";
 
-// Piece point values (Queen is not available as an aux piece)
 const PIECE_VALUES: Record<string, number> = { P: 1, N: 3, B: 3, R: 5 };
 
 export async function POST(
@@ -56,35 +62,32 @@ export async function POST(
     return NextResponse.json({ error: "Not participant" }, { status: 403 });
   }
 
-  const isWhite = game.whitePlayerId === userId; // for board orientation, FEN, masking
-  const isPlayer1 = game.player1Id === userId;              // for player1/player2 slot fields
-  const auxPoints = isPlayer1 ? game.auxPointsPlayer1 : game.auxPointsPlayer2;
+  const isWhite   = game.whitePlayerId === userId;
+  const isPlayer1 = game.player1Id === userId;
 
-  // Validate piece type
   const value = PIECE_VALUES[piece.toUpperCase()];
   if (!value) {
     return NextResponse.json({ error: "Invalid piece type" }, { status: 400 });
   }
 
-  // Validate points
+  // JS-level pre-check (fast path for clearly invalid requests)
+  const auxPoints = isPlayer1 ? game.auxPointsPlayer1 : game.auxPointsPlayer2;
   if (value > auxPoints) {
     return NextResponse.json({ error: "Not enough auxiliary points" }, { status: 400 });
   }
 
   // Validate square format
-  const rank = parseInt(square[1], 10);
+  const rank      = parseInt(square[1], 10);
   const fileIndex = square.charCodeAt(0) - "a".charCodeAt(0);
   if (isNaN(rank) || isNaN(fileIndex) || fileIndex < 0 || fileIndex > 7) {
     return NextResponse.json({ error: "Invalid square" }, { status: 400 });
   }
 
-  // Validate square is on own side
   const ownRanks = isWhite ? [1, 2] : [7, 8];
   if (!ownRanks.includes(rank)) {
     return NextResponse.json({ error: "Can only place on own ranks" }, { status: 400 });
   }
 
-  // Pawns can only go on the front rank
   if (piece.toUpperCase() === "P") {
     const pawnRank = isWhite ? 2 : 7;
     if (rank !== pawnRank) {
@@ -94,56 +97,71 @@ export async function POST(
 
   const currentFen = game.fen ?? "";
 
-  // Check square is empty
   if (getPieceAt(currentFen, square) !== "1") {
     return NextResponse.json({ error: "Square is already occupied" }, { status: 400 });
   }
 
-  // Build new FEN with piece placed
   const pieceChar = isWhite ? piece.toUpperCase() : piece.toLowerCase();
-  const newFen = placePieceOnFen(currentFen, pieceChar, square);
+  const newFen    = placePieceOnFen(currentFen, pieceChar, square);
 
-  // Validate battery rule
   if (hasIllegalBattery(newFen, isWhite)) {
     return NextResponse.json({ error: "Illegal battery — cannot place here" }, { status: 400 });
   }
 
-  // Persist
-  const updatedGame = await prisma.game.update({
-    where: { id: gameId },
+  // ── Atomic conditional update (#4) ────────────────────────────────────────
+  // The WHERE clause checks that points are still sufficient at the DB level.
+  // If two concurrent requests for the same player race here, only one will
+  // match the gte condition; the other sees count=0.
+  const pointsField = isPlayer1 ? "auxPointsPlayer1" : "auxPointsPlayer2";
+
+  const updateResult = await prisma.game.updateMany({
+    where: {
+      id:     gameId,
+      status: "prep",
+      // DB-level guard: points must still cover the cost
+      ...(isPlayer1
+        ? { auxPointsPlayer1: { gte: value } }
+        : { auxPointsPlayer2: { gte: value } }),
+    },
     data: {
       fen: newFen,
-      ...(isPlayer1
-        ? { auxPointsPlayer1: auxPoints - value }
-        : { auxPointsPlayer2: auxPoints - value }),
+      [pointsField]: { decrement: value },
     },
   });
 
-  // ─── Per-player masked broadcasts ─────────────────────────────────────────
-  // Each player receives their own view:
-  //   - The placing player: sees their own new piece + opponent's original draft
-  //   - The opponent: sees the same as before (placing player's new piece is hidden)
+  if (updateResult.count === 0) {
+    return NextResponse.json(
+      { error: "Not enough auxiliary points or game state changed" },
+      { status: 409 }
+    );
+  }
+
+  // Re-fetch to get accurate updated point values for broadcast
+  const updatedGame = await prisma.game.findUnique({
+    where:  { id: gameId },
+    select: { auxPointsPlayer1: true, auxPointsPlayer2: true },
+  });
+
+  // ── Per-player masked broadcasts ──────────────────────────────────────────
   const emitToGameUser = (global as any).emitToGameUser;
 
   if (emitToGameUser && game.draft1?.fen && game.draft2?.fen) {
     const originalFen = buildCombinedDraftFen(game.draft1.fen, game.draft2.fen);
 
-    // Placing player: mask OPPONENT's aux pieces (not their own)
     const placerMaskedFen = maskOpponentAuxPlacements(newFen, originalFen, isWhite);
     emitToGameUser(gameId, userId, "game-update", {
       fen: placerMaskedFen,
-      auxPointsPlayer1: updatedGame.auxPointsPlayer1,
-      auxPointsPlayer2: updatedGame.auxPointsPlayer2,
+      auxPointsPlayer1: updatedGame?.auxPointsPlayer1,
+      auxPointsPlayer2: updatedGame?.auxPointsPlayer2,
     });
 
-    // Opponent: mask the placing player's aux pieces
-    const opponentId = isPlayer1 ? game.player2Id : game.player1Id;
-    const opponentIsWhite = !isWhite;
+    const opponentId       = isPlayer1 ? game.player2Id : game.player1Id;
+    const opponentIsWhite  = !isWhite;
     const opponentMaskedFen = maskOpponentAuxPlacements(newFen, originalFen, opponentIsWhite);
     emitToGameUser(gameId, opponentId, "game-update", {
       fen: opponentMaskedFen,
-      auxPointsPlayer1: updatedGame.auxPointsPlayer1,
-      auxPointsPlayer2: updatedGame.auxPointsPlayer2,
+      auxPointsPlayer1: updatedGame?.auxPointsPlayer1,
+      auxPointsPlayer2: updatedGame?.auxPointsPlayer2,
     });
   }
 

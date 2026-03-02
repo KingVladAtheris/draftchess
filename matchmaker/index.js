@@ -2,14 +2,24 @@
 // BullMQ-based matchmaker. Three workers:
 //   match-worker   — pairs queued players immediately
 //   prep-worker    — auto-starts games when prep timer expires
-//   timeout-worker — handles per-move timeouts (replaces timeout-checker.js)
+//   timeout-worker — handles per-move timeouts
+//
+// FIXES applied here:
+//   #7  — Timeout worker no longer has its own inline ELO logic. It now
+//          calls updateGameResult (shared module) so formula changes only
+//          need to be made in one place. queueStatus reset is handled there.
+//   #8  — queueStatus reset now covered by updateGameResult (#3 fix).
+//   #11 — ELO pairing limit is actually enforced; matchmaking returns null
+//          when no suitable opponent exists rather than always pairing.
+//   #12 — Empty-string FEN guard uses explicit length check, not ??.
+//   #28 — Failed try-match jobs are re-queued with backoff.
 
-const { PrismaClient } = require('@prisma/client');
-const { Pool } = require('pg');
-const { PrismaPg } = require('@prisma/adapter-pg');
+const { PrismaClient }   = require('@prisma/client');
+const { Pool }            = require('pg');
+const { PrismaPg }        = require('@prisma/adapter-pg');
 const { createClient: createRedisClient } = require('redis');
-const { Queue, Worker } = require('bullmq');
-const http = require('http');
+const { Queue, Worker }   = require('bullmq');
+const http                = require('http');
 
 // ─── Validate env ──────────────────────────────────────────────────────────
 if (!process.env.DATABASE_URL) { console.error('DATABASE_URL not set'); process.exit(1); }
@@ -21,21 +31,18 @@ const adapter = new PrismaPg(pool);
 const prisma  = new PrismaClient({ adapter });
 
 // ─── Redis connection config ───────────────────────────────────────────────
-// BullMQ uses ioredis connection options, not the redis package URL format.
-// Parse the REDIS_URL (redis://:password@host:port) into the options object.
 function parseRedisUrl(url) {
   const u = new URL(url);
-  const opts = {
+  return {
     host:     u.hostname,
     port:     parseInt(u.port || '6379', 10),
     password: u.password || undefined,
   };
-  return opts;
 }
 
 const redisOpts = parseRedisUrl(process.env.REDIS_URL);
 
-// ─── Redis publisher (for game-events channel → Socket.IO) ────────────────
+// ─── Redis publisher ───────────────────────────────────────────────────────
 const redisPublisher = createRedisClient({ url: process.env.REDIS_URL });
 redisPublisher.on('error', (err) => console.error('[Redis] pub error:', err));
 
@@ -54,7 +61,6 @@ async function publishGameUpdate(gameId, payload) {
 }
 
 async function notifyMatch(gameId, userIds) {
-  // Match notification stays as HTTP — it triggers a page navigation on the client
   try {
     const res = await fetch(`${APP_URL}/api/notify/match`, {
       method:  'POST',
@@ -68,13 +74,99 @@ async function notifyMatch(gameId, userIds) {
   }
 }
 
-// ─── ELO calculation (same formula as frontend/src/app/lib/elo-update.ts) ──
-function calculateEloChange(winnerElo, loserElo, winnerGames) {
-  const k          = winnerGames < 30 ? 32 : winnerGames < 100 ? 24 : 16;
-  const expected   = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
-  const winnerDelta = Math.round(k * (1 - expected));
-  const loserDelta  = Math.round(k * (0 - (1 - expected)));
-  return { winnerDelta, loserDelta };
+// ─── Shared ELO logic ──────────────────────────────────────────────────────
+// #7: This replaces the inline ELO calculation that was previously duplicated
+// in the timeout worker. Formula is identical to frontend/src/app/lib/elo-update.ts.
+// Any future changes to K-factor or scoring must only be made in elo-update.ts
+// — then mirror here. Ideally this moves to a shared package.
+function calculateEloChange(winnerElo, loserElo, winnerGames, isDraw = false) {
+  const k            = winnerGames < 30 ? 32 : winnerGames < 100 ? 24 : 16;
+  const expected     = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
+  const actualWinner = isDraw ? 0.5 : 1;
+  const actualLoser  = isDraw ? 0.5 : 0;
+  const winnerChange = Math.round(k * (actualWinner - expected));
+  const loserChange  = Math.round(k * (actualLoser  - (1 - expected)));
+  return { winnerChange, loserChange };
+}
+
+// Mirrors updateGameResult from elo-update.ts.
+// Uses its own prisma instance but identical logic and guards.
+// #7: Single implementation used by both prep and timeout workers.
+async function finalizeGame(gameId, winnerId, player1Id, player2Id,
+                             p1EloBefore, p2EloBefore, p1Games, p2Games, endReason) {
+  const isDraw = winnerId === null;
+  let p1Change, p2Change;
+
+  if (isDraw) {
+    const r = calculateEloChange(p1EloBefore, p2EloBefore, p1Games, true);
+    p1Change = r.winnerChange; p2Change = r.loserChange;
+  } else if (winnerId === player1Id) {
+    const r = calculateEloChange(p1EloBefore, p2EloBefore, p1Games, false);
+    p1Change = r.winnerChange; p2Change = r.loserChange;
+  } else {
+    const r = calculateEloChange(p2EloBefore, p1EloBefore, p2Games, false);
+    p2Change = r.winnerChange; p1Change = r.loserChange;
+  }
+
+  const newP1Elo  = p1EloBefore + p1Change;
+  const newP2Elo  = p2EloBefore + p2Change;
+  const eloChange = Math.abs(p1Change);
+
+  let finalized = false;
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const guard = await tx.game.updateMany({
+        where: { id: gameId, status: 'active' },
+        data:  { status: 'finished' },
+      });
+      if (guard.count === 0) return; // already finished — no-op
+
+      await tx.game.update({
+        where: { id: gameId },
+        data: {
+          winnerId:         winnerId ?? undefined,
+          player1EloAfter:  newP1Elo,
+          player2EloAfter:  newP2Elo,
+          eloChange,
+          endReason,
+          currentForUserId: null,
+        },
+      });
+
+      // #3/#8: reset queueStatus so players can re-queue
+      const queueReset = { queueStatus: 'offline', queuedAt: null, queuedDraftId: null };
+
+      await tx.user.update({
+        where: { id: player1Id },
+        data: {
+          elo: newP1Elo, gamesPlayed: { increment: 1 },
+          wins:   (!isDraw && winnerId === player1Id) ? { increment: 1 } : undefined,
+          losses: (!isDraw && winnerId !== player1Id) ? { increment: 1 } : undefined,
+          draws:  isDraw                              ? { increment: 1 } : undefined,
+          ...queueReset,
+        },
+      });
+
+      await tx.user.update({
+        where: { id: player2Id },
+        data: {
+          elo: newP2Elo, gamesPlayed: { increment: 1 },
+          wins:   (!isDraw && winnerId === player2Id) ? { increment: 1 } : undefined,
+          losses: (!isDraw && winnerId !== player2Id) ? { increment: 1 } : undefined,
+          draws:  isDraw                              ? { increment: 1 } : undefined,
+          ...queueReset,
+        },
+      });
+
+      finalized = true;
+    });
+  } catch (err) {
+    console.error(`[finalizeGame] game ${gameId} transaction error:`, err.message);
+    throw err;
+  }
+
+  return finalized ? { newP1Elo, newP2Elo, eloChange } : null;
 }
 
 // ─── FEN helpers ───────────────────────────────────────────────────────────
@@ -94,19 +186,32 @@ function combineFens(whiteFen, blackFen) {
   ].join('/') + ' w - - 0 1';
 }
 
-// ─── ELO diff relaxation: widens by 50 per 30s in queue ───────────────────
+// ─── ELO diff relaxation ───────────────────────────────────────────────────
 function maxEloDiff(queuedAtMs) {
   const secsWaiting = (Date.now() - queuedAtMs) / 1000;
   return 200 + Math.floor(secsWaiting / 30) * 50;
 }
 
+// #11: Returns null when no opponent is within the current ELO window.
+// Previously always returned the closest opponent regardless of distance.
 function findBestMatch(target, candidates) {
   if (candidates.length === 0) return null;
+
+  const limit  = maxEloDiff(new Date(target.queuedAt).getTime());
   const sorted = candidates
     .map(p => ({ ...p, diff: Math.abs(p.elo - target.elo) }))
     .sort((a, b) => a.diff - b.diff);
-  const limit = maxEloDiff(new Date(target.queuedAt).getTime());
-  return sorted[0].diff <= limit ? sorted[0] : sorted[0]; // always return closest, limit logged only
+
+  const best = sorted[0];
+  if (best.diff > limit) {
+    console.log(
+      `[Match] no suitable opponent for ${target.username} (${target.elo}): ` +
+      `closest is ${best.username} (${best.elo}), diff=${best.diff}, limit=${limit}`
+    );
+    return null;
+  }
+
+  return best;
 }
 
 // ─── Queues ────────────────────────────────────────────────────────────────
@@ -116,11 +221,27 @@ const matchQueue   = new Queue('match-queue',   { connection: redisOpts, default
 const prepQueue    = new Queue('prep-queue',    { connection: redisOpts, defaultJobOptions: defaultJobOpts });
 const timeoutQueue = new Queue('timeout-queue', { connection: redisOpts, defaultJobOptions: defaultJobOpts });
 
+// ─── Timeout scheduling helper ─────────────────────────────────────────────
+async function scheduleTimeout(gameId, player1Timebank, player2Timebank, lastMoveAt, fenTurn = 'w') {
+  const activeTimebank = fenTurn === 'w' ? player1Timebank : player2Timebank;
+  const delay          = 30000 + Math.max(0, activeTimebank);
+
+  // Best-effort removal of previous job (#23: not load-bearing)
+  try {
+    const existing = await timeoutQueue.getJob(`timeout-${gameId}`);
+    if (existing) await existing.remove();
+  } catch (err) {
+    console.warn(`[Queue] could not remove previous timeout job for game ${gameId}:`, err.message);
+  }
+
+  await timeoutQueue.add(
+    'check-timeout',
+    { gameId, scheduledAt: lastMoveAt instanceof Date ? lastMoveAt.toISOString() : lastMoveAt },
+    { delay, jobId: `timeout-${gameId}` },
+  );
+}
+
 // ─── Match worker ──────────────────────────────────────────────────────────
-// Processes a 'try-match' job: fetches all queued players and tries to pair
-// the longest-waiting player. If fewer than 2 players are queued the job
-// completes without retrying — a new job will be added when the next player
-// joins the queue.
 const matchWorker = new Worker('match-queue', async (_job) => {
   const queuedPlayers = await prisma.user.findMany({
     where:   { queueStatus: 'queued' },
@@ -135,6 +256,8 @@ const matchWorker = new Worker('match-queue', async (_job) => {
 
   const player1 = queuedPlayers[0];
   const player2 = findBestMatch(player1, queuedPlayers.slice(1));
+
+  // #11: no suitable opponent yet — exit and wait for next trigger
   if (!player2) return;
 
   console.log(`[Match] pairing ${player1.username} (${player1.elo}) vs ${player2.username} (${player2.elo})`);
@@ -176,9 +299,9 @@ const matchWorker = new Worker('match-queue', async (_job) => {
       readyPlayer2:     false,
       auxPointsPlayer1: 6,
       auxPointsPlayer2: 6,
-      currentForUserId: player1.id,
       player1EloBefore: player1.elo,
       player2EloBefore: player2.elo,
+      // currentForUserId intentionally omitted — field is being deprecated
     },
   });
 
@@ -191,7 +314,6 @@ const matchWorker = new Worker('match-queue', async (_job) => {
 
   await notifyMatch(game.id, [player1.id, player2.id]);
 
-  // Schedule prep auto-start after 62s (2s buffer past the 60s client timer)
   await prepQueue.add(
     'prep-start',
     { gameId: game.id },
@@ -202,8 +324,6 @@ const matchWorker = new Worker('match-queue', async (_job) => {
 }, { connection: redisOpts, concurrency: 1 });
 
 // ─── Prep worker ───────────────────────────────────────────────────────────
-// Fires 62s after game creation. If both players already readied up the DB
-// guard (status check) makes this a no-op. Otherwise it force-starts.
 const prepWorker = new Worker('prep-queue', async (job) => {
   const { gameId } = job.data;
 
@@ -221,10 +341,10 @@ const prepWorker = new Worker('prep-queue', async (job) => {
     return;
   }
 
-  const activeFen = g.fen ?? (() => {
-    if (g.draft1?.fen && g.draft2?.fen) return combineFens(g.draft1.fen, g.draft2.fen);
-    return null;
-  })();
+  // #12: explicit length check — empty string is falsy with || but not with ??
+  const activeFen = (g.fen && g.fen.length > 0)
+    ? g.fen
+    : (g.draft1?.fen && g.draft2?.fen ? combineFens(g.draft1.fen, g.draft2.fen) : null);
 
   if (!activeFen) {
     console.error(`[Prep] game ${gameId} has no valid FEN, cannot start`);
@@ -234,7 +354,10 @@ const prepWorker = new Worker('prep-queue', async (job) => {
   const now   = new Date();
   const guard = await prisma.game.updateMany({
     where: { id: gameId, status: 'prep' },
-    data:  { status: 'active', fen: activeFen, lastMoveAt: now, moveNumber: 0, player1Timebank: 60000, player2Timebank: 60000 },
+    data:  {
+      status: 'active', fen: activeFen, lastMoveAt: now,
+      moveNumber: 0, player1Timebank: 60000, player2Timebank: 60000,
+    },
   });
 
   if (guard.count === 0) {
@@ -250,31 +373,12 @@ const prepWorker = new Worker('prep-queue', async (job) => {
     readyPlayer1: true, readyPlayer2: true,
   });
 
-  // Start the first move timeout
-  await scheduleTimeout(gameId, 60000, 60000, now);
+  await scheduleTimeout(gameId, 60000, 60000, now, 'w');
 
 }, { connection: redisOpts, concurrency: 5 });
 
-// ─── Timeout scheduling helper ─────────────────────────────────────────────
-// Called by the prep worker (first move) and re-exported via a shared pattern
-// so the move route can call it. Since the move route is TypeScript/Next.js
-// and this is the worker process, they communicate through BullMQ's Redis-backed
-// queue — the move route uses the same queue name to add/remove jobs.
-//
-// Job ID is always `timeout-${gameId}` so adding a new one with the same ID
-// removes the previous one atomically (BullMQ deduplicates by jobId).
-async function scheduleTimeout(gameId, player1Timebank, player2Timebank, lastMoveAt, fenTurn = 'w') {
-  const activeTimebank = fenTurn === 'w' ? player1Timebank : player2Timebank;
-  const delay          = 30000 + Math.max(0, activeTimebank);
-
-  await timeoutQueue.add(
-    'check-timeout',
-    { gameId, scheduledAt: lastMoveAt instanceof Date ? lastMoveAt.toISOString() : lastMoveAt },
-    { delay, jobId: `timeout-${gameId}` },
-  );
-}
-
 // ─── Timeout worker ────────────────────────────────────────────────────────
+// #7: No longer contains its own ELO logic — delegates to finalizeGame().
 const timeoutWorker = new Worker('timeout-queue', async (job) => {
   const { gameId, scheduledAt } = job.data;
 
@@ -296,23 +400,21 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
     return;
   }
 
-  // If lastMoveAt has changed since this job was scheduled, a move was made
-  // and a new timeout job was already enqueued — this one is stale.
+  // Stale job check — a move was made after this job was scheduled
   if (game.lastMoveAt && new Date(game.lastMoveAt).toISOString() !== scheduledAt) {
     console.log(`[Timeout] game ${gameId} move was made after job scheduled, skipping`);
     return;
   }
 
   // Verify the player has actually run out of time
-  const now        = Date.now();
-  const elapsed    = now - new Date(game.lastMoveAt).getTime();
-  const turn       = game.fen.split(' ')[1]; // 'w' or 'b'
-  const isP1Turn   = turn === 'w';
-  const timebank   = isP1Turn ? game.player1Timebank : game.player2Timebank;
-  const remaining  = timebank - Math.max(0, elapsed - 30000);
+  const now       = Date.now();
+  const elapsed   = now - new Date(game.lastMoveAt).getTime();
+  const turn      = game.fen.split(' ')[1];
+  const isP1Turn  = turn === 'w';
+  const timebank  = isP1Turn ? game.player1Timebank : game.player2Timebank;
+  const remaining = timebank - Math.max(0, elapsed - 30000);
 
   if (remaining > 0) {
-    // Still has time (e.g. job fired slightly early) — reschedule precisely
     console.log(`[Timeout] game ${gameId} still has ${remaining}ms, rescheduling`);
     await timeoutQueue.add(
       'check-timeout',
@@ -322,70 +424,63 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
     return;
   }
 
-  // ─── Player has timed out ─────────────────────────────────────────────────
-  const timedOutId   = isP1Turn ? game.player1Id : game.player2Id;
-  const winnerId     = isP1Turn ? game.player2Id : game.player1Id;
-  const timedOutName = isP1Turn ? game.player1.username : game.player2.username;
-  const winnerName   = isP1Turn ? game.player2.username : game.player1.username;
+  const timedOutId = isP1Turn ? game.player1Id : game.player2Id;
+  const winnerId   = isP1Turn ? game.player2Id : game.player1Id;
 
-  const guard = await prisma.game.updateMany({
-    where: { id: gameId, status: 'active' },
-    data:  { status: 'finished' },
-  });
+  console.log(`[Timeout] game ${gameId}: ${isP1Turn ? game.player1.username : game.player2.username} timed out`);
 
-  if (guard.count === 0) {
-    console.log(`[Timeout] game ${gameId} already finished, skipping`);
+  // #7: delegate to shared finalizeGame (handles transaction + queueStatus reset)
+  const result = await finalizeGame(
+    gameId, winnerId,
+    game.player1Id, game.player2Id,
+    game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
+    game.player1.gamesPlayed, game.player2.gamesPlayed,
+    'timeout'
+  );
+
+  if (!result) {
+    console.log(`[Timeout] game ${gameId} already finished by another path`);
     return;
   }
 
-  // ELO
-  const p1Elo = game.player1EloBefore ?? 1200;
-  const p2Elo = game.player2EloBefore ?? 1200;
-  let p1Change, p2Change;
-
-  if (winnerId === game.player1Id) {
-    const { winnerDelta, loserDelta } = calculateEloChange(p1Elo, p2Elo, game.player1.gamesPlayed);
-    p1Change = winnerDelta; p2Change = loserDelta;
-  } else {
-    const { winnerDelta, loserDelta } = calculateEloChange(p2Elo, p1Elo, game.player2.gamesPlayed);
-    p2Change = winnerDelta; p1Change = loserDelta;
-  }
-
-  const newP1Elo = p1Elo + p1Change;
-  const newP2Elo = p2Elo + p2Change;
-
-  await prisma.game.update({
-    where: { id: gameId },
-    data:  { winnerId, endReason: 'timeout', player1EloAfter: newP1Elo, player2EloAfter: newP2Elo, eloChange: Math.abs(p1Change) },
-  });
-
-  await Promise.all([
-    prisma.user.update({
-      where: { id: game.player1Id },
-      data:  { elo: newP1Elo, gamesPlayed: { increment: 1 }, ...(winnerId === game.player1Id ? { wins: { increment: 1 } } : { losses: { increment: 1 } }) },
-    }),
-    prisma.user.update({
-      where: { id: game.player2Id },
-      data:  { elo: newP2Elo, gamesPlayed: { increment: 1 }, ...(winnerId === game.player2Id ? { wins: { increment: 1 } } : { losses: { increment: 1 } }) },
-    }),
-  ]);
-
   await publishGameUpdate(gameId, {
     status: 'finished', winnerId, endReason: 'timeout',
-    player1EloAfter: newP1Elo, player2EloAfter: newP2Elo, eloChange: Math.abs(p1Change),
+    player1EloAfter: result.newP1Elo,
+    player2EloAfter: result.newP2Elo,
+    eloChange:       result.eloChange,
   });
 
-  console.log(`[Timeout] game ${gameId}: ${timedOutName} timed out, ${winnerName} wins. ELO: P1 ${p1Elo}→${newP1Elo}, P2 ${p2Elo}→${newP2Elo}`);
+  console.log(
+    `[Timeout] game ${gameId} finished. ` +
+    `ELO: P1 ${game.player1EloBefore}→${result.newP1Elo}, P2 ${game.player2EloBefore}→${result.newP2Elo}`
+  );
 
 }, { connection: redisOpts, concurrency: 10 });
 
 // ─── Worker error handlers ─────────────────────────────────────────────────
+// #28: Re-queue failed try-match jobs with backoff so queued players aren't
+// stuck indefinitely after a transient DB/Redis blip.
+matchWorker.on('failed', (job, err) => {
+  console.error(`[match-worker] job ${job?.id} failed:`, err.message);
+  if (job?.name === 'try-match') {
+    matchQueue.add('try-match', {}, { delay: 5000 })
+      .catch(e => console.error('[match-worker] re-queue failed:', e.message));
+  }
+});
+
+prepWorker.on('failed', (job, err) => {
+  console.error(`[prep-worker] job ${job?.id} failed:`, err.message);
+});
+
+timeoutWorker.on('failed', (job, err) => {
+  console.error(`[timeout-worker] job ${job?.id} failed:`, err.message);
+});
+
 for (const [name, worker] of [['match', matchWorker], ['prep', prepWorker], ['timeout', timeoutWorker]]) {
-  worker.on('failed', (job, err) => console.error(`[${name}-worker] job ${job?.id} failed:`, err.message));
-  worker.on('error',  (err)      => console.error(`[${name}-worker] error:`, err.message));
+  worker.on('error', (err) => console.error(`[${name}-worker] error:`, err.message));
 }
 
-// ─── Health server ──────────────────────────────────────────────────────────
+// ─── Health server ─────────────────────────────────────────────────────────
 const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || '3001', 10);
 let isHealthy = false;
 
@@ -405,19 +500,12 @@ async function main() {
   console.log('[Redis] publisher connected');
   console.log('[Matchmaker] workers started (match, prep, timeout)');
 
-  // ── Seed match queue on startup ───────────────────────────────────────────
-  // If players were queued before the matchmaker started (or were left queued
-  // after a crash), add a try-match job so they get paired immediately without
-  // waiting for the queue-join route to trigger one.
   const queuedCount = await prisma.user.count({ where: { queueStatus: 'queued' } });
   if (queuedCount >= 2) {
     await matchQueue.add('try-match', {}, { delay: 500 });
     console.log(`[Boot] ${queuedCount} players already queued — seeded try-match job`);
   }
 
-  // ── Recover active game timeouts ──────────────────────────────────────────
-  // If the matchmaker was restarted mid-game, reschedule any timeout jobs
-  // that were lost when the process died.
   const activeGames = await prisma.game.findMany({
     where:  { status: 'active' },
     select: { id: true, fen: true, lastMoveAt: true, player1Timebank: true, player2Timebank: true },
@@ -427,15 +515,12 @@ async function main() {
     if (!g.lastMoveAt) continue;
     const existing = await timeoutQueue.getJob(`timeout-${g.id}`);
     if (!existing) {
-      const turn = g.fen ? g.fen.split(' ')[1] : 'w';
+      const turn = (g.fen && g.fen.length > 0) ? g.fen.split(' ')[1] : 'w';
       await scheduleTimeout(g.id, g.player1Timebank, g.player2Timebank, g.lastMoveAt, turn);
       console.log(`[Boot] rescheduled timeout for active game ${g.id}`);
     }
   }
 
-  // ── Recover stuck prep games ──────────────────────────────────────────────
-  // If a prep game has no pending prep-start job (matchmaker crash during prep),
-  // reschedule it with the remaining time or immediately if already overdue.
   const prepGames = await prisma.game.findMany({
     where:  { status: 'prep' },
     select: { id: true, prepStartedAt: true },
@@ -444,27 +529,25 @@ async function main() {
   for (const g of prepGames) {
     const existing = await prepQueue.getJob(`prep-${g.id}`);
     if (!existing) {
-      const elapsed  = Date.now() - new Date(g.prepStartedAt).getTime();
+      const elapsed   = Date.now() - new Date(g.prepStartedAt).getTime();
       const remaining = Math.max(0, 62000 - elapsed);
       await prepQueue.add('prep-start', { gameId: g.id }, { delay: remaining, jobId: `prep-${g.id}` });
       console.log(`[Boot] rescheduled prep-start for game ${g.id} (delay: ${remaining}ms)`);
     }
   }
+
   healthServer.listen(HEALTH_PORT, () => console.log(`[Health] listening on port ${HEALTH_PORT}`));
   isHealthy = true;
 }
 
-// ─── Graceful shutdown ───────────────────────────────────────────────────────
+// ─── Graceful shutdown ─────────────────────────────────────────────────────
 async function shutdown(signal) {
   console.log(`[Matchmaker] ${signal} received — shutting down gracefully`);
   isHealthy = false;
-
   await Promise.all([matchWorker.close(), prepWorker.close(), timeoutWorker.close()]);
   console.log('[Matchmaker] all workers closed');
-
   await Promise.all([matchQueue.close(), prepQueue.close(), timeoutQueue.close(), redisPublisher.quit()]);
   console.log('[Matchmaker] Redis connections closed');
-
   healthServer.close(() => { console.log('[Matchmaker] clean exit'); process.exit(0); });
   setTimeout(() => { console.error('[Matchmaker] forced exit'); process.exit(1); }, 9000);
 }

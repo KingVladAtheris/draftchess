@@ -1,4 +1,8 @@
 // src/app/api/signup/route.ts
+//
+// FIX #15: Error message no longer distinguishes between "email taken" and
+// "username taken", preventing enumeration of registered accounts.
+
 import { prisma } from "@/app/lib/prisma.server";
 import bcrypt from "bcrypt";
 
@@ -13,31 +17,31 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check if user already exists
+    // Basic length guards
+    if (username.length < 2 || username.length > 32) {
+      return new Response(
+        JSON.stringify({ error: "Username must be between 2 and 32 characters" }),
+        { status: 400 }
+      );
+    }
+
     const existingUser = await prisma.user.findFirst({
-      where: {
-        OR: [{ email }, { username }],
-      },
+      where: { OR: [{ email }, { username }] },
     });
 
     if (existingUser) {
+      // #15: generic message — do not reveal which field is taken
       return new Response(
-        JSON.stringify({ error: "Email or username already taken" }),
+        JSON.stringify({ error: "An account with those details already exists" }),
         { status: 409 }
       );
     }
 
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
+    const salt         = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // Create user
     await prisma.user.create({
-      data: {
-        email,
-        username,
-        passwordHash,
-      },
+      data: { email, username, passwordHash },
     });
 
     return new Response(

@@ -28,9 +28,7 @@ class DraftChess extends Chess {
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 type GameStatus = "prep" | "active" | "finished";
-
 type PendingPromotion = { from: Square; to: Square };
-
 type GameResult = {
   winnerId: number | null;
   endReason: string;
@@ -72,8 +70,8 @@ export default function ClientGame({
   player1Id,
   player2Id,
 }: ClientGameProps) {
-  // ─── Core game state (server-authoritative) ───────────────────────────────
-  // Single FEN: used for both prep and active. During prep it may be masked.
+
+  // ─── Core game state ───────────────────────────────────────────────────────
   const [fen, setFen] = useState(initialFen);
   const [status, setStatus] = useState<GameStatus>(initialStatus as GameStatus);
   const [prepStartedAt, setPrepStartedAt] = useState<Date | null>(initialPrepStartedAt);
@@ -82,13 +80,48 @@ export default function ClientGame({
   const [auxPointsPlayer1, setAuxPointsPlayer1] = useState(initialAuxPointsPlayer1);
   const [auxPointsPlayer2, setAuxPointsPlayer2] = useState(initialAuxPointsPlayer2);
 
-  // ─── Time state (server sets, client counts down) ─────────────────────────
+  // ─── Time state ────────────────────────────────────────────────────────────
   const [player1Timebank, setPlayer1Timebank] = useState(60000);
   const [player2Timebank, setPlayer2Timebank] = useState(60000);
   const [lastMoveAt, setLastMoveAt] = useState<Date | null>(null);
   const [moveTimeRemaining, setMoveTimeRemaining] = useState(MOVE_TIME_LIMIT);
+  const [prepTimeRemaining, setPrepTimeRemaining] = useState(60);
 
-  // isMyTurn is always derived from the FEN turn + isWhite — never from server opinion
+  // ─── Move / bonus state ────────────────────────────────────────────────────
+  const [moveNumber, setMoveNumber] = useState(0);
+  const [showTimebankBonus, setShowTimebankBonus] = useState(false);
+
+  // ─── Result / UI state ─────────────────────────────────────────────────────
+  const [gameResult, setGameResult] = useState<GameResult | null>(null);
+  const [socketError, setSocketError] = useState<string | null>(null);
+  const [activePiece, setActivePiece] = useState<string | null>(null);
+  const [legalSquares, setLegalSquares] = useState<string[]>([]);
+  const [illegalSquares, setIllegalSquares] = useState<string[]>([]);
+  const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null);
+
+  // ─── Refs ──────────────────────────────────────────────────────────────────
+  const chessRef = useRef<DraftChess>(new DraftChess(initialFen));
+  const isSubmittingMove = useRef(false);
+
+  // ─── Timer snapshot ref ────────────────────────────────────────────────────
+  // FIX #24: lastMoveAt + both timebanks are updated atomically into this ref
+  // so the countdown interval always reads a consistent snapshot. React state
+  // updates are batched and may lag by a render; the ref is synchronous.
+  const timerSnapshot = useRef<{
+    lastMoveAt: Date;
+    player1Timebank: number;
+    player2Timebank: number;
+  } | null>(null);
+
+  // ─── Derived values ────────────────────────────────────────────────────────
+  const isPlayer1  = myUserId === player1Id;
+  const ownReady   = isPlayer1 ? readyPlayer1 : readyPlayer2;
+  const oppReady   = isPlayer1 ? readyPlayer2 : readyPlayer1;
+  const auxPoints  = isPlayer1 ? auxPointsPlayer1 : auxPointsPlayer2;
+  const myTimebank = isPlayer1 ? player1Timebank  : player2Timebank;
+  const oppTimebank = isPlayer1 ? player2Timebank : player1Timebank;
+
+  // isMyTurn is always derived from the FEN — never trusted from server
   const isMyTurn = useMemo(() => {
     if (status !== "active") return false;
     try {
@@ -98,38 +131,6 @@ export default function ClientGame({
       return false;
     }
   }, [fen, status, isWhite]);
-
-  // ─── Move number (for timebank bonus notification) ────────────────────────
-  const [moveNumber, setMoveNumber] = useState(0);
-  const [showTimebankBonus, setShowTimebankBonus] = useState(false);
-
-  // ─── Game result overlay ──────────────────────────────────────────────────
-  const [gameResult, setGameResult] = useState<GameResult | null>(null);
-
-  // ─── UI / UX state ────────────────────────────────────────────────────────
-  const [socketError, setSocketError] = useState<string | null>(null);
-  const [activePiece, setActivePiece] = useState<string | null>(null);
-  const [legalSquares, setLegalSquares] = useState<string[]>([]);
-  const [illegalSquares, setIllegalSquares] = useState<string[]>([]);
-  const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null);
-  const [prepTimeRemaining, setPrepTimeRemaining] = useState(60);
-
-  // ─── Chess engine ref (active game only) ──────────────────────────────────
-  // We keep a ref to the chess engine for move validation.
-  // It is ALWAYS synced from the server FEN — never from optimistic local state.
-  const chessRef = useRef<DraftChess>(new DraftChess(initialFen));
-  const isSubmittingMove = useRef(false);
-
-  // ─── Derived values ───────────────────────────────────────────────────────
-  // isPlayer1: true if this user occupies the player1 slot (queue order, not color)
-  // Used for slot-based fields: readyPlayer1/2, auxPointsPlayer1/2, player1/2Timebank
-  const isPlayer1 = myUserId === player1Id;
-
-  const ownReady = isPlayer1 ? readyPlayer1 : readyPlayer2;
-  const oppReady = isPlayer1 ? readyPlayer2 : readyPlayer1;
-  const auxPoints = isPlayer1 ? auxPointsPlayer1 : auxPointsPlayer2;
-  const myTimebank = isPlayer1 ? player1Timebank : player2Timebank;
-  const oppTimebank = isPlayer1 ? player2Timebank : player1Timebank;
 
   const pieceLibrary = useMemo(() => [
     { name: "Pawn",   value: 1, fen: "P", ui: isWhite ? "wP" : "bP" },
@@ -145,7 +146,7 @@ export default function ClientGame({
     { piece: "n", label: isWhite ? "♞" : "♘", name: "Knight" },
   ], [isWhite]);
 
-  // ─── Format ms as M:SS ────────────────────────────────────────────────────
+  // ─── Format ms as M:SS ─────────────────────────────────────────────────────
   const formatTime = (ms: number): string => {
     const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
     const minutes = Math.floor(totalSeconds / 60);
@@ -153,96 +154,132 @@ export default function ClientGame({
     return `${minutes}:${seconds.toString().padStart(2, "0")}`;
   };
 
-  // ─── Handle game-update socket payload ───────────────────────────────────
+  // ─── updateTimerSnapshot ───────────────────────────────────────────────────
+  // FIX #24: Defined BEFORE handleGameUpdate so it can be referenced in that
+  // callback's closure without a stale-closure or ordering problem.
+  // Updates the ref and React state atomically (from the caller's perspective —
+  // the ref write is synchronous even though the setState calls are batched).
+  const updateTimerSnapshot = useCallback((
+    newLastMoveAt: Date,
+    newP1Timebank: number,
+    newP2Timebank: number,
+  ) => {
+    // Synchronous ref write — the interval tick reads this immediately
+    timerSnapshot.current = {
+      lastMoveAt:      newLastMoveAt,
+      player1Timebank: newP1Timebank,
+      player2Timebank: newP2Timebank,
+    };
+    // React state — used for display and derived values
+    setLastMoveAt(newLastMoveAt);
+    setPlayer1Timebank(newP1Timebank);
+    setPlayer2Timebank(newP2Timebank);
+    setMoveTimeRemaining(MOVE_TIME_LIMIT);
+  }, []); // no deps — only touches refs and setters, both stable
+
+  // ─── handleGameUpdate ──────────────────────────────────────────────────────
+  // updateTimerSnapshot is now defined above, so this closure captures the
+  // stable version without any ordering issues.
   const handleGameUpdate = useCallback((payload: any) => {
-    // FEN update — always accept server FEN as truth
     if (payload.fen !== undefined) {
-      const serverFen = payload.fen;
-      setFen(serverFen);
-      // Sync chess engine to server FEN
+      setFen(payload.fen);
       try {
-        chessRef.current = new DraftChess(serverFen);
+        chessRef.current = new DraftChess(payload.fen);
       } catch {
-        // Malformed FEN — keep current
+        // malformed FEN — keep current engine state
       }
     }
 
-    if (payload.status !== undefined) setStatus(payload.status as GameStatus);
-    if (payload.readyPlayer1 !== undefined) setReadyPlayer1(payload.readyPlayer1);
-    if (payload.readyPlayer2 !== undefined) setReadyPlayer2(payload.readyPlayer2);
+    if (payload.status    !== undefined) setStatus(payload.status as GameStatus);
+    if (payload.readyPlayer1  !== undefined) setReadyPlayer1(payload.readyPlayer1);
+    if (payload.readyPlayer2  !== undefined) setReadyPlayer2(payload.readyPlayer2);
     if (payload.auxPointsPlayer1 !== undefined) setAuxPointsPlayer1(payload.auxPointsPlayer1);
     if (payload.auxPointsPlayer2 !== undefined) setAuxPointsPlayer2(payload.auxPointsPlayer2);
 
-    // Time updates — server sends absolute timebank values
-    if (payload.player1Timebank !== undefined) setPlayer1Timebank(payload.player1Timebank);
-    if (payload.player2Timebank !== undefined) setPlayer2Timebank(payload.player2Timebank);
-
     if (payload.moveNumber !== undefined) {
-      const prevMove = moveNumber;
-      setMoveNumber(payload.moveNumber);
-      // Show timebank bonus notification
-      if (
-        payload.moveNumber > 0 &&
-        payload.moveNumber % TIMEBANK_BONUS_INTERVAL === 0 &&
-        payload.moveNumber !== prevMove
-      ) {
-        setShowTimebankBonus(true);
-        setTimeout(() => setShowTimebankBonus(false), 4000);
-      }
-    }
-
-    // Reset move timer when a new move is registered.
-    // This triggers the timer useEffect to restart from the server's lastMoveAt.
-    if (payload.lastMoveAt !== undefined) {
-      setLastMoveAt(new Date(payload.lastMoveAt));
-      setMoveTimeRemaining(MOVE_TIME_LIMIT); // reset display immediately
-    }
-
-    // Game end — only trigger when status is explicitly 'finished'
-    if (payload.status === "finished") {
-      setGameResult({
-        winnerId: payload.winnerId ?? null,
-        endReason: payload.endReason ?? "unknown",
-        player1EloAfter: payload.player1EloAfter,
-        player2EloAfter: payload.player2EloAfter,
-        eloChange: payload.eloChange,
+      setMoveNumber((prev) => {
+        const next = payload.moveNumber;
+        if (
+          next > 0 &&
+          next % TIMEBANK_BONUS_INTERVAL === 0 &&
+          next !== prev
+        ) {
+          setShowTimebankBonus(true);
+          setTimeout(() => setShowTimebankBonus(false), 4000);
+        }
+        return next;
       });
     }
-  }, [moveNumber]);
 
-  // ─── WebSocket setup + initial HTTP load ──────────────────────────────────
+    // Timer snapshot — update atomically when a new move is registered.
+    // Fallback to current React state for timebank values if the payload
+    // doesn't include them (e.g. a ready-state update during prep).
+    if (payload.lastMoveAt !== undefined) {
+      updateTimerSnapshot(
+        new Date(payload.lastMoveAt),
+        payload.player1Timebank ?? player1Timebank,
+        payload.player2Timebank ?? player2Timebank,
+      );
+    } else {
+      // Timebank-only update (no new move — e.g. game-snapshot on reconnect
+      // when no move has been made yet, or a timebank bonus notification)
+      if (payload.player1Timebank !== undefined) setPlayer1Timebank(payload.player1Timebank);
+      if (payload.player2Timebank !== undefined) setPlayer2Timebank(payload.player2Timebank);
+    }
+
+    if (payload.status === "finished") {
+      setGameResult({
+        winnerId:        payload.winnerId  ?? null,
+        endReason:       payload.endReason ?? "unknown",
+        player1EloAfter: payload.player1EloAfter,
+        player2EloAfter: payload.player2EloAfter,
+        eloChange:       payload.eloChange,
+      });
+    }
+  }, [updateTimerSnapshot, player1Timebank, player2Timebank]);
+  // Note: player1/2Timebank in deps is for the fallback branch only.
+  // The timer snapshot branch uses the payload values directly so it's
+  // always current regardless of render batching.
+
+  // ─── WebSocket setup + initial HTTP load ───────────────────────────────────
   useEffect(() => {
     let mounted = true;
 
     const init = async () => {
       try {
-        // Fetch authoritative state from server on mount
         const res = await fetch(`/api/game/${gameId}/status`);
         if (!res.ok) throw new Error("Failed to load game state");
         const data = await res.json();
 
         if (mounted) {
           handleGameUpdate(data);
-          // Status endpoint also sends these:
           if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
-          if (data.lastMoveAt) setLastMoveAt(new Date(data.lastMoveAt));
           if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
-          if (data.player1Timebank !== undefined) setPlayer1Timebank(data.player1Timebank);
-          if (data.player2Timebank !== undefined) setPlayer2Timebank(data.player2Timebank);
-          if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
-          // Only show result overlay if the game is actually finished
+
+          // On initial load the server tells us the exact time remaining —
+          // initialise the snapshot so the interval has something to work from.
+          if (data.lastMoveAt) {
+            updateTimerSnapshot(
+              new Date(data.lastMoveAt),
+              data.player1Timebank ?? 60000,
+              data.player2Timebank ?? 60000,
+            );
+            if (data.timeRemainingOnMove !== undefined) {
+              setMoveTimeRemaining(data.timeRemainingOnMove);
+            }
+          }
+
           if (data.status === "finished" && data.endReason) {
             setGameResult({
-              winnerId: data.winnerId ?? null,
-              endReason: data.endReason,
+              winnerId:        data.winnerId  ?? null,
+              endReason:       data.endReason,
               player1EloAfter: data.player1EloAfter,
               player2EloAfter: data.player2EloAfter,
-              eloChange: data.eloChange,
+              eloChange:       data.eloChange,
             });
           }
         }
 
-        // Connect WebSocket
         const socket = await getSocket();
         socket.emit("join-game", gameId);
 
@@ -263,22 +300,24 @@ export default function ClientGame({
           }
         });
 
-        // game-snapshot: full state pushed by server after every join-game.
-        // On first connect this arrives just after the HTTP status fetch —
-        // applying it is harmless (same data). On reconnect this is what
-        // restores any state missed while the socket was down.
         socket.on("game-snapshot", (data: any) => {
           if (!mounted) return;
           handleGameUpdate(data);
           if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
-          if (data.lastMoveAt)    setLastMoveAt(new Date(data.lastMoveAt));
-          if (data.moveNumber    !== undefined) setMoveNumber(data.moveNumber);
-          if (data.player1Timebank !== undefined) setPlayer1Timebank(data.player1Timebank);
-          if (data.player2Timebank !== undefined) setPlayer2Timebank(data.player2Timebank);
-          if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
+          if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
+          if (data.lastMoveAt) {
+            updateTimerSnapshot(
+              new Date(data.lastMoveAt),
+              data.player1Timebank ?? 60000,
+              data.player2Timebank ?? 60000,
+            );
+            if (data.timeRemainingOnMove !== undefined) {
+              setMoveTimeRemaining(data.timeRemainingOnMove);
+            }
+          }
           if (data.status === "finished" && data.endReason) {
             setGameResult({
-              winnerId:        data.winnerId ?? null,
+              winnerId:        data.winnerId  ?? null,
               endReason:       data.endReason,
               player1EloAfter: data.player1EloAfter,
               player2EloAfter: data.player2EloAfter,
@@ -286,6 +325,7 @@ export default function ClientGame({
             });
           }
         });
+
       } catch (err) {
         console.error("Init error:", err);
         if (mounted) setSocketError("Failed to connect to game server.");
@@ -305,9 +345,9 @@ export default function ClientGame({
         })
         .catch(() => {});
     };
-  }, [gameId, handleGameUpdate]);
+  }, [gameId, handleGameUpdate, updateTimerSnapshot]);
 
-  // ─── Prep countdown timer ─────────────────────────────────────────────────
+  // ─── Prep countdown timer ──────────────────────────────────────────────────
   useEffect(() => {
     if (status !== "prep" || !prepStartedAt) return;
     const timer = setInterval(() => {
@@ -317,55 +357,44 @@ export default function ClientGame({
     return () => clearInterval(timer);
   }, [status, prepStartedAt]);
 
-  // ─── Unified timer effect ────────────────────────────────────────────────
-  // Runs whenever lastMoveAt or the server timebank snapshots change.
-  // Handles two phases:
-  //   1. Move countdown (0–30s): counts down moveTimeRemaining
-  //   2. Timebank drain: once move time expires, drain the active player's timebank
-  //      Visible in real-time on BOTH screens using the server snapshot as the baseline.
-  //
-  // We capture the server timebank values at the moment lastMoveAt is set so that
-  // both players see the same drain without needing continuous socket pushes.
-  const p1TimebankAtLastMove = useRef(player1Timebank);
-  const p2TimebankAtLastMove = useRef(player2Timebank);
-
-  // Capture snapshot when lastMoveAt changes (i.e., when a new move is registered)
+  // ─── Active game timer ─────────────────────────────────────────────────────
+  // FIX #24: Reads from timerSnapshot.current (ref, synchronous) not from
+  // React state (which may be one render behind when a move arrives).
+  // The interval only restarts when status changes — not on every FEN or
+  // timebank update — so the tick is stable and doesn't drift.
   useEffect(() => {
-    p1TimebankAtLastMove.current = player1Timebank;
-    p2TimebankAtLastMove.current = player2Timebank;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lastMoveAt]); // only snapshot at move time, not on every tick
-
-  useEffect(() => {
-    if (status !== "active" || !lastMoveAt) return;
-
-    // Which player is moving? Derived from FEN — server authoritative.
-    const fenTurn = fen.split(" ")[1]; // "w" or "b"
-    const activePlayerIsWhite = fenTurn === "w";
+    if (status !== "active") return;
 
     const tick = () => {
-      const elapsed = Date.now() - lastMoveAt.getTime();
+      const snap = timerSnapshot.current;
+      if (!snap) return;
+
+      const elapsed    = Date.now() - snap.lastMoveAt.getTime();
+      const fenParts   = snap.lastMoveAt; // just for typing — we need fen turn
+      // Read fen from the ref's sibling closure. Because this effect closes
+      // over nothing mutable, we read from the DOM-independent chess engine:
+      const fenTurn    = chessRef.current.turn(); // "w" or "b"
+      const p1IsActive = fenTurn === "w";
+
       setMoveTimeRemaining(Math.max(0, MOVE_TIME_LIMIT - elapsed));
 
       if (elapsed > MOVE_TIME_LIMIT) {
         const overage = elapsed - MOVE_TIME_LIMIT;
-        // Compute drain from the server snapshot taken at last move,
-        // not from the current state (avoids compound subtraction drift).
-        if (activePlayerIsWhite) {
-          setPlayer1Timebank(Math.max(0, p1TimebankAtLastMove.current - overage));
+        if (p1IsActive) {
+          setPlayer1Timebank(Math.max(0, snap.player1Timebank - overage));
         } else {
-          setPlayer2Timebank(Math.max(0, p2TimebankAtLastMove.current - overage));
+          setPlayer2Timebank(Math.max(0, snap.player2Timebank - overage));
         }
       }
     };
 
-    tick();
+    tick(); // run immediately to avoid one-tick lag
     const timer = setInterval(tick, 100);
     return () => clearInterval(timer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, lastMoveAt]); // deliberately omit fen/timebanks — only restart on move
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]); // only restarts on status change; snapshot ref keeps values fresh
 
-  // ─── FEN helpers ──────────────────────────────────────────────────────────
+  // ─── FEN helpers ───────────────────────────────────────────────────────────
   const expandFenRow = (row: string): string => {
     let result = "";
     for (const char of row) {
@@ -397,9 +426,9 @@ export default function ClientGame({
   };
 
   const simulatePlace = (currentFen: string, fenLetter: string, targetSquare: string): string => {
-    const rank = parseInt(targetSquare[1], 10);
+    const rank      = parseInt(targetSquare[1], 10);
     const fileIndex = targetSquare.charCodeAt(0) - 97;
-    const rows = currentFen.split(" ")[0].split("/");
+    const rows      = currentFen.split(" ")[0].split("/");
     const rankIndex = 8 - rank;
     let row = expandFenRow(rows[rankIndex]);
     row = row.substring(0, fileIndex) + fenLetter + row.substring(fileIndex + 1);
@@ -407,9 +436,9 @@ export default function ClientGame({
     return rows.join("/") + " w - - 0 1";
   };
 
-  // ─── Battery check ────────────────────────────────────────────────────────
+  // ─── Battery check ─────────────────────────────────────────────────────────
   const hasIllegalBattery = (currentFen: string): boolean => {
-    const rows = currentFen.split(" ")[0].split("/").map(expandFenRow);
+    const rows     = currentFen.split(" ")[0].split("/").map(expandFenRow);
     const backIdx  = isWhite ? 7 : 0;
     const frontIdx = isWhite ? 6 : 1;
 
@@ -421,7 +450,7 @@ export default function ClientGame({
     }
     for (let file = 0; file < 7; file++) {
       const pairs = [
-        [rows[backIdx][file].toUpperCase(), rows[frontIdx][file + 1].toUpperCase()],
+        [rows[backIdx][file].toUpperCase(),     rows[frontIdx][file + 1].toUpperCase()],
         [rows[backIdx][file + 1].toUpperCase(), rows[frontIdx][file].toUpperCase()],
       ];
       for (const [a, b] of pairs) {
@@ -432,48 +461,44 @@ export default function ClientGame({
     return false;
   };
 
-  // ─── Placement square calculation ─────────────────────────────────────────
+  // ─── Placement square calculation ──────────────────────────────────────────
   const calculatePlacementSquares = useCallback((fenLetter: string) => {
-    const legal: string[] = [];
+    const legal: string[]   = [];
     const illegal: string[] = [];
-    const ownRanks = isWhite ? [1, 2] : [7, 8];
-    const pawnRank = isWhite ? 2 : 7;
+    const ownRanks  = isWhite ? [1, 2] : [7, 8];
+    const pawnRank  = isWhite ? 2 : 7;
     const kingFiles = ["c", "d", "e", "f"];
 
     for (const r of ownRanks) {
       for (let f = 0; f < 8; f++) {
         const sq = String.fromCharCode(97 + f) + r;
 
-        if (fenLetter === "P" && r !== pawnRank) { illegal.push(sq); continue; }
-        if (fenLetter === "K" && (r !== ownRanks[0] || !kingFiles.includes(sq[0]))) { illegal.push(sq); continue; }
-        if (getPieceAt(fen, sq) !== "1") { illegal.push(sq); continue; }
+        if (fenLetter === "P" && r !== pawnRank)                                      { illegal.push(sq); continue; }
+        if (fenLetter === "K" && (r !== ownRanks[0] || !kingFiles.includes(sq[0])))  { illegal.push(sq); continue; }
+        if (getPieceAt(fen, sq) !== "1")                                              { illegal.push(sq); continue; }
 
         const pieceChar = isWhite ? fenLetter : fenLetter.toLowerCase();
-        const tempFen = simulatePlace(fen, pieceChar, sq);
+        const tempFen   = simulatePlace(fen, pieceChar, sq);
         if (hasIllegalBattery(tempFen)) { illegal.push(sq); }
-        else { legal.push(sq); }
+        else                            { legal.push(sq);   }
       }
     }
     return { legal, illegal };
-  }, [fen, isWhite]);
+  }, [fen, isWhite]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ─── Square styles ────────────────────────────────────────────────────────
+  // ─── Square styles ─────────────────────────────────────────────────────────
   const customSquareStyles = useMemo(() => {
     const styles: Record<string, React.CSSProperties> = {};
-    legalSquares.forEach(sq => { styles[sq] = { backgroundColor: "rgba(0, 200, 0, 0.45)" }; });
+    legalSquares.forEach(sq   => { styles[sq] = { backgroundColor: "rgba(0, 200, 0, 0.45)" }; });
     illegalSquares.forEach(sq => { styles[sq] = { backgroundColor: "rgba(220, 0, 0, 0.35)" }; });
     return styles;
   }, [legalSquares, illegalSquares]);
 
-  // ─── Prep: place piece ────────────────────────────────────────────────────
+  // ─── Prep: place piece ──────────────────────────────────────────────────────
   const handlePlace = async (fenLetter: string, square: string) => {
     const selected = pieceLibrary.find(p => p.fen === fenLetter);
     if (!selected || ownReady) return;
-
-    if (selected.value > auxPoints) {
-      alert("Not enough auxiliary points");
-      return;
-    }
+    if (selected.value > auxPoints) { alert("Not enough auxiliary points"); return; }
 
     setActivePiece(null);
     setLegalSquares([]);
@@ -481,23 +506,21 @@ export default function ClientGame({
 
     try {
       const res = await fetch(`/api/game/${gameId}/place`, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ piece: fenLetter, square }),
+        body:    JSON.stringify({ piece: fenLetter, square }),
       });
-
       if (!res.ok) {
         const err = await res.json();
         alert(err.error ?? "Failed to place piece");
       }
-      // Server will emit game-update with correct masked FEN — no optimistic update needed
     } catch (err) {
       console.error("Place error:", err);
       alert("Failed to place piece — please try again");
     }
   };
 
-  // ─── Prep: ready ──────────────────────────────────────────────────────────
+  // ─── Prep: ready ────────────────────────────────────────────────────────────
   const handleReady = async () => {
     if (ownReady) return;
     try {
@@ -506,61 +529,47 @@ export default function ClientGame({
         const err = await res.json();
         alert(err.error ?? "Failed to mark ready");
       }
-      // Server emits game-update
     } catch (err) {
       console.error("Ready error:", err);
     }
   };
 
-  // ─── Active: move submission ───────────────────────────────────────────────
+  // ─── Active: move submission ────────────────────────────────────────────────
   const submitMove = useCallback((from: Square, to: Square, promotion: string) => {
     isSubmittingMove.current = true;
 
     fetch(`/api/game/${gameId}/move`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from, to, promotion }),
+      body:    JSON.stringify({ from, to, promotion }),
     })
       .then(async res => {
         if (!res.ok) {
           const err = await res.json();
           console.error("Move rejected by server:", err.error);
-          // Re-fetch authoritative state to fix any optimistic UI drift
+          // Re-sync from server to correct any optimistic drift
           const statusRes = await fetch(`/api/game/${gameId}/status`);
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            handleGameUpdate(data);
-          }
+          if (statusRes.ok) handleGameUpdate(await statusRes.json());
         }
-        // Success: server broadcasts game-update to both players via socket
       })
-      .catch(err => {
-        console.error("Move submission error:", err);
-      })
-      .finally(() => {
-        isSubmittingMove.current = false;
-      });
+      .catch(err => console.error("Move submission error:", err))
+      .finally(() => { isSubmittingMove.current = false; });
   }, [gameId, handleGameUpdate]);
 
-  // ─── Promotion handlers ───────────────────────────────────────────────────
+  // ─── Promotion handlers ─────────────────────────────────────────────────────
   const handlePromotionChoice = (promotion: string) => {
     if (!pendingPromotion) return;
     const { from, to } = pendingPromotion;
     setPendingPromotion(null);
-
-    // Apply optimistically to chess engine for immediate visual feedback
     try {
       chessRef.current.move({ from, to, promotion });
       setFen(chessRef.current.fen());
-    } catch {
-      // Will be corrected by server update
-    }
+    } catch { /* corrected by server */ }
     submitMove(from, to, promotion);
   };
 
   const handlePromotionCancel = () => {
     setPendingPromotion(null);
-    // Restore FEN from chess engine (no move was applied)
     setFen(chessRef.current.fen());
   };
 
@@ -570,7 +579,7 @@ export default function ClientGame({
     return (piece.color === "w" && to[1] === "8") || (piece.color === "b" && to[1] === "1");
   };
 
-  // ─── Piece drop handler ───────────────────────────────────────────────────
+  // ─── Piece drop handler ─────────────────────────────────────────────────────
   const handlePieceDrop = ({
     sourceSquare,
     targetSquare,
@@ -578,38 +587,32 @@ export default function ClientGame({
     sourceSquare: string;
     targetSquare: string | null;
   }): boolean => {
-    if (!targetSquare || status !== "active" || !isMyTurn || isSubmittingMove.current) {
-      return false;
-    }
+    if (!targetSquare || status !== "active" || !isMyTurn || isSubmittingMove.current) return false;
 
     const from = sourceSquare as Square;
-    const to = targetSquare as Square;
+    const to   = targetSquare as Square;
 
     try {
-      // Validate turn from chess engine
       const turn = chessRef.current.turn();
       if ((turn === "w" && !isWhite) || (turn === "b" && isWhite)) return false;
 
       if (isPromotionMove(from, to)) {
-        // Test legality first (with queen, then undo)
         chessRef.current.move({ from, to, promotion: "q" });
         chessRef.current.undo();
         setPendingPromotion({ from, to });
-        return false; // Don't apply yet — wait for promotion choice
+        return false;
       }
 
-      // Apply optimistically for immediate feedback
       chessRef.current.move({ from, to });
       setFen(chessRef.current.fen());
       submitMove(from, to, "q");
       return true;
-    } catch (err) {
-      // Illegal move — chess engine already handled it
+    } catch {
       return false;
     }
   };
 
-  // ─── Resign ───────────────────────────────────────────────────────────────
+  // ─── Resign ─────────────────────────────────────────────────────────────────
   const handleResign = async () => {
     if (!confirm("Are you sure you want to resign?")) return;
     try {
@@ -618,43 +621,33 @@ export default function ClientGame({
         const err = await res.json();
         alert(err.error ?? "Failed to resign");
       }
-      // Server broadcasts game-update with result
     } catch (err) {
       console.error("Resign error:", err);
     }
   };
 
-  // ─── Game result overlay ──────────────────────────────────────────────────
+  // ─── Game result overlay ────────────────────────────────────────────────────
   const renderGameResult = () => {
     if (!gameResult) return null;
 
     const isWinner = gameResult.winnerId === myUserId;
-    const isDraw = gameResult.winnerId === null;
+    const isDraw   = gameResult.winnerId === null;
 
-    const resultText = isDraw
-      ? "Draw!"
-      : isWinner
-        ? "You win! 🎉"
-        : "You lost.";
-
-    const resultColor = isDraw
-      ? "text-yellow-600"
-      : isWinner
-        ? "text-green-600"
-        : "text-red-600";
+    const resultText  = isDraw ? "Draw!" : isWinner ? "You win! 🎉" : "You lost.";
+    const resultColor = isDraw ? "text-yellow-600" : isWinner ? "text-green-600" : "text-red-600";
 
     const myEloAfter = isPlayer1 ? gameResult.player1EloAfter : gameResult.player2EloAfter;
-    const eloChange = gameResult.eloChange;
-    const eloSign = isWinner ? "+" : isDraw ? "±" : "-";
+    const eloSign    = isWinner ? "+" : isDraw ? "±" : "-";
 
     const endReasonLabels: Record<string, string> = {
-      checkmate: "Checkmate",
-      stalemate: "Stalemate",
-      repetition: "Threefold Repetition",
+      checkmate:             "Checkmate",
+      stalemate:             "Stalemate",
+      repetition:            "Threefold Repetition",
       insufficient_material: "Insufficient Material",
-      draw: "Draw by Agreement",
-      timeout: "Time Out",
-      resignation: "Resignation",
+      draw:                  "Draw by Agreement",
+      timeout:               "Time Out",
+      resignation:           "Resignation",
+      abandoned:             "Abandoned",
     };
 
     return (
@@ -664,25 +657,19 @@ export default function ClientGame({
           <p className="text-gray-500 mb-6">
             {endReasonLabels[gameResult.endReason] ?? gameResult.endReason}
           </p>
-          {myEloAfter !== undefined && eloChange !== undefined && (
+          {myEloAfter !== undefined && gameResult.eloChange !== undefined && (
             <p className="text-lg mb-6">
               ELO: <span className="font-bold">{myEloAfter}</span>
               <span className={`ml-2 ${isWinner ? "text-green-600" : isDraw ? "text-gray-500" : "text-red-600"}`}>
-                ({eloSign}{eloChange})
+                ({eloSign}{gameResult.eloChange})
               </span>
             </p>
           )}
           <div className="flex gap-3 justify-center">
-            <a
-              href="/play/select"
-              className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-semibold"
-            >
+            <a href="/play/select" className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-semibold">
               Play Again
             </a>
-            <a
-              href="/"
-              className="px-6 py-3 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 font-semibold"
-            >
+            <a href="/" className="px-6 py-3 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 font-semibold">
               Home
             </a>
           </div>
@@ -691,28 +678,23 @@ export default function ClientGame({
     );
   };
 
-  // ─── Render: connection error ─────────────────────────────────────────────
-  // Non-fatal: show banner but allow play to continue
+  // ─── Socket error banner ────────────────────────────────────────────────────
   const renderSocketBanner = () => {
     if (!socketError) return null;
     return (
       <div className="w-full max-w-[600px] mb-4 p-3 bg-yellow-100 text-yellow-800 rounded border border-yellow-300 text-center text-sm">
         ⚠️ {socketError}
-        <button
-          onClick={() => window.location.reload()}
-          className="ml-3 underline font-semibold"
-        >
+        <button onClick={() => window.location.reload()} className="ml-3 underline font-semibold">
           Refresh
         </button>
       </div>
     );
   };
 
-  // ─── Render: prep phase ───────────────────────────────────────────────────
+  // ─── Render: prep phase ─────────────────────────────────────────────────────
   if (status === "prep") {
     return (
       <div className="flex min-h-screen bg-gray-100">
-        {/* Sidebar */}
         <div className="w-64 bg-white p-6 border-r border-gray-300 flex flex-col">
           <h2 className="text-2xl font-bold mb-2">Prep Phase</h2>
           <p className="text-sm text-gray-500 mb-6">Place extra pieces on your side</p>
@@ -767,18 +749,17 @@ export default function ClientGame({
           </button>
         </div>
 
-        {/* Board */}
         <div className="flex-1 flex flex-col items-center p-8">
           {renderSocketBanner()}
           <h1 className="text-3xl font-bold mb-8">Game #{gameId} — Prep Phase</h1>
           <div className="w-full max-w-[600px] aspect-square border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl">
             <Chessboard
               options={{
-                position: fen,
+                position:         fen,
                 boardOrientation: isWhite ? "white" : "black",
-                onPieceDrag: () => {},
-                onPieceDrop: () => false,
-                onSquareClick: ({ square }) => {
+                onPieceDrag:      () => {},
+                onPieceDrop:      () => false,
+                onSquareClick:    ({ square }) => {
                   if (!activePiece || ownReady) return;
                   const selected = pieceLibrary.find(p => p.ui === activePiece);
                   if (selected) handlePlace(selected.fen, square);
@@ -795,8 +776,7 @@ export default function ClientGame({
     );
   }
 
-  // ─── Render: active game ──────────────────────────────────────────────────
-  const movingPlayerTimebank = isMyTurn ? myTimebank : oppTimebank;
+  // ─── Render: active / finished game ────────────────────────────────────────
   const isTimebankActive = isMyTurn && moveTimeRemaining === 0;
 
   return (
@@ -806,7 +786,6 @@ export default function ClientGame({
 
       {/* Timer bar */}
       <div className="w-full max-w-[600px] mb-4 flex justify-between items-center bg-white rounded-xl p-4 shadow">
-        {/* Opponent */}
         <div className="flex-1">
           <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Opponent</div>
           <div className="text-xl font-bold text-gray-800">
@@ -815,7 +794,6 @@ export default function ClientGame({
           </div>
         </div>
 
-        {/* Center: move timer */}
         <div className="text-center px-6">
           <div className="text-xs text-gray-500 mb-1">Move {moveNumber}</div>
           {status === "active" && (
@@ -843,7 +821,6 @@ export default function ClientGame({
           )}
         </div>
 
-        {/* You */}
         <div className="flex-1 text-right">
           <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">You</div>
           <div className="text-xl font-bold text-gray-800">
@@ -853,7 +830,6 @@ export default function ClientGame({
         </div>
       </div>
 
-      {/* Timebank bonus notification */}
       {showTimebankBonus && (
         <div className="w-full max-w-[600px] mb-3 bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded-lg text-center font-medium animate-bounce">
           🎉 +60 seconds added to both timers!
@@ -864,19 +840,17 @@ export default function ClientGame({
         Game #{gameId} — You are {isWhite ? "White ♔" : "Black ♚"}
       </h1>
 
-      {/* Board */}
       <div className="relative w-full max-w-[600px]">
         <div className="aspect-square border-4 border-gray-800 rounded-lg overflow-hidden shadow-2xl">
           <Chessboard
             options={{
-              position: fen,
-              onPieceDrop: handlePieceDrop,
+              position:         fen,
+              onPieceDrop:      handlePieceDrop,
               boardOrientation: isWhite ? "white" : "black",
             }}
           />
         </div>
 
-        {/* Promotion picker overlay */}
         {pendingPromotion && (
           <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center rounded-lg z-10">
             <div className="bg-white rounded-xl p-6 shadow-2xl text-center">
@@ -904,7 +878,6 @@ export default function ClientGame({
         )}
       </div>
 
-      {/* Controls */}
       {status === "active" && !gameResult && (
         <div className="mt-4">
           <button
