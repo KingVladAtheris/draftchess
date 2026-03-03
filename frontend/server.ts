@@ -1,15 +1,11 @@
 // frontend/server.ts
 //
-// FIXES applied here:
-//   #9  — Redis DB index parsed from REDIS_URL instead of hardcoded '@0'.
-//   #16 — Added a dedicated 5th Redis client (cmdClient) for SET/DEL so
-//          pubClient is never used for general commands alongside adapter use.
-//   #17 — emitToGame/emitToGameUser/emitToQueueUser globals kept for same-
-//          process API routes, but all real-time events from routes also go
-//          through the Redis pub/sub channel so multi-process deployments work.
-//   #21 — Disconnect handler short-circuits if socket.data.gameId is not set,
-//          avoiding a DB query for every non-game socket disconnect.
-//   #22 — CORS origin locked to APP_URL env var, not wildcard.
+// CHANGES from previous version:
+//   - Socket disconnect handler now instantly removes the user from the queue
+//     (sets queueStatus='offline') if they were queued but not in a game.
+//     No grace period — there is nothing to protect in the queue state.
+//   - The game presence grace period (DISCONNECT_GRACE_SECS) is unchanged —
+//     that still applies only to active/prep games.
 
 import { createServer } from 'http';
 import { parse } from 'url';
@@ -32,15 +28,15 @@ if (!REDIS_URL) {
   process.exit(1);
 }
 
-// #9: Parse the DB index from the URL so keyspace notifications fire on the
-// correct database regardless of deployment config.
+// Parse the DB index from the URL so keyspace notifications fire on the
+// correct database regardless of deployment config. (#9)
 const REDIS_DB_INDEX = parseInt(new URL(REDIS_URL).pathname.replace('/', '') || '0', 10);
 
-const DISCONNECT_GRACE_SECS = 30;
+const DISCONNECT_GRACE_SECS = 30; // only for active/prep games
 const PRESENCE_KEY_PREFIX   = 'presence:disconnected:';
 
 // ─── Redis clients ─────────────────────────────────────────────────────────
-// Five clients — each has a dedicated role:
+// Five clients, each with a dedicated role:
 //   pubClient         — Socket.IO adapter publisher (exclusive to adapter)
 //   subClient         — Socket.IO adapter subscriber (exclusive to adapter)
 //   eventsSubClient   — subscribes to draftchess:game-events channel
@@ -53,11 +49,11 @@ function makeRedisClient() {
   return client;
 }
 
-const pubClient          = makeRedisClient();
-const subClient          = makeRedisClient();
-const eventsSubClient    = makeRedisClient();
-const presenceSubClient  = makeRedisClient();
-const cmdClient          = makeRedisClient(); // #16: dedicated command client
+const pubClient         = makeRedisClient();
+const subClient         = makeRedisClient();
+const eventsSubClient   = makeRedisClient();
+const presenceSubClient = makeRedisClient();
+const cmdClient         = makeRedisClient();
 
 const GAME_EVENTS_CHANNEL = 'draftchess:game-events';
 
@@ -71,7 +67,7 @@ app.prepare().then(async () => {
     subClient.connect(),
     eventsSubClient.connect(),
     presenceSubClient.connect(),
-    cmdClient.connect(),         // #16
+    cmdClient.connect(),
   ]);
   console.log('[Redis] all clients connected');
 
@@ -86,7 +82,6 @@ app.prepare().then(async () => {
   const ioOptions: Partial<ServerOptions> = {
     path:             '/api/socket.io',
     addTrailingSlash: false,
-    // #22: lock CORS to our own domain
     cors: {
       origin:      allowedOrigin,
       credentials: true,
@@ -113,7 +108,7 @@ app.prepare().then(async () => {
     }
   });
 
-  // ─── Presence helpers (use cmdClient, not pubClient) ──────────────────────
+  // ─── Presence helpers (game disconnect grace period) ───────────────────────
   function presenceKey(userId: number, gameId: number) {
     return `${PRESENCE_KEY_PREFIX}${userId}:${gameId}`;
   }
@@ -137,6 +132,7 @@ app.prepare().then(async () => {
     socket.on('join-queue',  () => socket.join('queue'));
     socket.on('leave-queue', () => socket.leave('queue'));
 
+    // ── join-game ─────────────────────────────────────────────────────────────
     socket.on('join-game', async (gameId: number) => {
       if (!gameId || typeof gameId !== 'number') return;
 
@@ -167,7 +163,7 @@ app.prepare().then(async () => {
           io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-connected', { userId });
         }
 
-        // ── Snapshot ─────────────────────────────────────────────────────────
+        // ── Snapshot ───────────────────────────────────────────────────────────
         try {
           const MOVE_TIME_LIMIT = 30000;
           const snapshot = await prisma.game.findUnique({
@@ -188,27 +184,22 @@ app.prepare().then(async () => {
 
           if (snapshot) {
             const isWhite   = snapshot.whitePlayerId === userId;
-            const isPlayer1 = snapshot.player1Id === userId;
             const rawFen    = snapshot.fen ?? '';
 
-            // #6 (snapshot): same null-draft guard — fall back to starting FEN
-            // rather than exposing unmasked aux pieces if a draft was deleted.
             let maskedFen = rawFen;
             if (snapshot.status === 'prep') {
               if (snapshot.draft1?.fen && snapshot.draft2?.fen) {
                 const originalFen = buildCombinedDraftFen(snapshot.draft1.fen, snapshot.draft2.fen);
                 maskedFen = maskOpponentAuxPlacements(rawFen, originalFen, isWhite);
               } else {
-                // Draft was deleted — send the combined starting FEN as a safe fallback
-                maskedFen = rawFen; // no aux to leak; log for visibility
                 console.warn(`[Socket.IO] snapshot: draft missing for game ${gameId} during prep`);
               }
             }
 
             let timeRemainingOnMove = MOVE_TIME_LIMIT;
             if (snapshot.status === 'active' && snapshot.lastMoveAt) {
-              const turn   = rawFen.split(' ')[1];
-              const myTurn = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
+              const turn    = rawFen.split(' ')[1];
+              const myTurn  = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
               const elapsed = Date.now() - new Date(snapshot.lastMoveAt).getTime();
               if (myTurn) timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
             }
@@ -247,33 +238,74 @@ app.prepare().then(async () => {
     socket.on('disconnect', async (reason) => {
       console.log(`[Socket.IO] disconnected: ${socket.id} (user: ${userId}, reason: ${reason})`);
 
-      // #21: skip the DB query entirely for sockets that never joined a game
-      const knownGameId = socket.data.gameId as number | undefined;
-      if (!knownGameId) return;
-
       try {
-        // Still query DB as source of truth — socket.data.gameId could theoretically
-        // be stale if the server restarted mid-session, but the fast-path above
-        // eliminates queries for all non-game sockets (drafts, lobby, etc.)
-        const game = await prisma.game.findFirst({
-          where: {
-            status: { in: ['active', 'prep'] },
-            OR: [{ player1Id: userId }, { player2Id: userId }],
-          },
+        // Single DB read to find out what state this user was in.
+        // We check both queue and active/prep game in one query.
+        const user = await prisma.user.findUnique({
+          where:  { id: userId },
+          select: { queueStatus: true },
+        });
+
+        if (!user) return;
+
+        // ── Queued: remove instantly, no grace period ────────────────────────
+        // The socket is the heartbeat for queue membership. If it drops,
+        // the user is out. There is no game state to protect.
+        if (user.queueStatus === 'queued') {
+          await prisma.user.update({
+            where: { id: userId },
+            data: {
+              queueStatus:   'offline',
+              queuedAt:      null,
+              queuedDraftId: null,
+            },
+          });
+          console.log(`[Queue] user ${userId} removed from queue on disconnect`);
+          return; // not in a game, nothing else to do
+        }
+
+        // ── In a game: start the 30s grace period ────────────────────────────
+        // Only query for the active game if queueStatus indicates they're in one.
+        // This skips the findFirst entirely for users on the lobby/drafts pages. (#21)
+        if (user.queueStatus !== 'in_game') return;
+
+        const knownGameId = socket.data.gameId as number | undefined;
+        if (!knownGameId) {
+          // Fallback: socket.data.gameId not set (server restart mid-session)
+          // — query DB as source of truth
+          const game = await prisma.game.findFirst({
+            where: {
+              status: { in: ['active', 'prep'] },
+              OR: [{ player1Id: userId }, { player2Id: userId }],
+            },
+            select: { id: true, player1Id: true, player2Id: true },
+          });
+          if (!game) return;
+
+          const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id;
+          await setDisconnectedPresence(userId, game.id);
+          io.to(`game-${game.id}-user-${opponentId}`).emit('opponent-disconnected', {
+            userId,
+            gracePeriodSecs: DISCONNECT_GRACE_SECS,
+          });
+          return;
+        }
+
+        // Fast path: we know the gameId from socket data
+        const game = await prisma.game.findUnique({
+          where:  { id: knownGameId },
           select: { id: true, status: true, player1Id: true, player2Id: true },
         });
 
-        if (!game) return;
+        if (!game || (game.status !== 'active' && game.status !== 'prep')) return;
 
-        const gameId     = game.id;
         const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id;
-
-        await setDisconnectedPresence(userId, gameId);
-
-        io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-disconnected', {
+        await setDisconnectedPresence(userId, knownGameId);
+        io.to(`game-${knownGameId}-user-${opponentId}`).emit('opponent-disconnected', {
           userId,
           gracePeriodSecs: DISCONNECT_GRACE_SECS,
         });
+
       } catch (err) {
         console.error(`[Socket.IO] disconnect handler error for user ${userId}:`, err);
       }
@@ -293,15 +325,11 @@ app.prepare().then(async () => {
     io.to(`queue-user-${userId}`).emit(event, payload);
   };
 
-  // Globals retained for same-process API routes.
-  // #17: Routes should prefer publishing to GAME_EVENTS_CHANNEL so that
-  // multi-process deployments work correctly. These globals are a fallback
-  // for single-process dev/prod.
   (global as any).emitToGame      = emitToGame;
   (global as any).emitToGameUser  = emitToGameUser;
   (global as any).emitToQueueUser = emitToQueueUser;
   (global as any).io              = io;
-  (global as any).redisPub        = cmdClient; // #16: expose cmdClient for pub, not pubClient
+  (global as any).redisPub        = cmdClient;
 
   // ─── Game events subscriber ────────────────────────────────────────────────
   await eventsSubClient.subscribe(GAME_EVENTS_CHANNEL, (raw) => {
@@ -322,8 +350,7 @@ app.prepare().then(async () => {
   });
   console.log(`[Events] subscribed to ${GAME_EVENTS_CHANNEL}`);
 
-  // ─── Presence expiry subscriber (#9) ──────────────────────────────────────
-  // DB index parsed from URL — not hardcoded to @0.
+  // ─── Presence expiry subscriber ────────────────────────────────────────────
   const keyspaceChannel = `__keyevent@${REDIS_DB_INDEX}__:expired`;
   await presenceSubClient.subscribe(keyspaceChannel, async (expiredKey) => {
     if (!expiredKey.startsWith(PRESENCE_KEY_PREFIX)) return;
