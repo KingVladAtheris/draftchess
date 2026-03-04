@@ -1,12 +1,4 @@
 // app/api/game/[id]/move/route.ts
-//
-// FIXES applied here:
-//   #5 — Move persistence now uses updateMany with status:'active' guard.
-//        If a resign/timeout finished the game between our initial check and
-//        this write, we return 409 instead of overwriting finished-game fields.
-//   #6 — Timebank overage is stored as a decrement expression, not a
-//        pre-computed value, eliminating the read-modify-write race on
-//        concurrent duplicate requests.
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
@@ -14,6 +6,7 @@ import { prisma } from "@/app/lib/prisma.server";
 import { Chess } from "chess.js";
 import { updateGameResult } from "@/app/lib/elo-update";
 import { scheduleTimeoutJob, cancelTimeoutJob } from "@/app/lib/queues";
+import { consume, moveLimiter } from "@/app/lib/rate-limit";
 
 const MOVE_TIME_LIMIT         = 30000;
 const TIMEBANK_BONUS_INTERVAL = 20;
@@ -42,6 +35,9 @@ export async function POST(
   const { id } = await params;
   const userId = parseInt(session.user.id);
   const gameId = parseInt(id);
+
+  const limited = await consume(moveLimiter, req, userId.toString());
+  if (limited) return limited;
 
   let body: any;
   try {
@@ -102,16 +98,10 @@ export async function POST(
   const lastMoveTime = game.lastMoveAt ? new Date(game.lastMoveAt) : now;
   const elapsedMs    = now.getTime() - lastMoveTime.getTime();
   const isPlayer1    = game.player1Id === userId;
-
-  // #6: Read the timebank from DB for validation, but write using Prisma
-  // expressions (decrement) so the DB enforces atomicity rather than JS.
   const currentTimebank = isPlayer1 ? game.player1Timebank : game.player2Timebank;
   const overage         = Math.max(0, elapsedMs - MOVE_TIME_LIMIT);
 
   if (overage > 0 && currentTimebank - overage <= 0) {
-    // This player has timed out — opponent wins.
-    // updateGameResult is transactional so a concurrent timeout worker
-    // finishing the game first is handled gracefully.
     const winnerId = isPlayer1 ? game.player2Id : game.player1Id;
 
     const result = await updateGameResult(
@@ -135,9 +125,10 @@ export async function POST(
       }
     }
 
-    return NextResponse.json({
-      success: false, error: "Your time has expired", winnerId, endReason: "timeout",
-    }, { status: 400 });
+    return NextResponse.json(
+      { success: false, error: "Your time has expired", winnerId, endReason: "timeout" },
+      { status: 400 }
+    );
   }
 
   // ─── Validate and execute move ────────────────────────────────────────────
@@ -151,46 +142,36 @@ export async function POST(
   const newMoveNumber = game.moveNumber + 1;
 
   // ─── Game-ending conditions ───────────────────────────────────────────────
-  let newStatus: string = "active";
+  let newStatus: string  = "active";
   let winnerId: number | null = null;
   let endReason: string | null = null;
 
-  if (chess.isCheckmate())              { newStatus = "finished"; winnerId = userId; endReason = "checkmate"; }
-  else if (chess.isStalemate())         { newStatus = "finished"; endReason = "stalemate"; }
+  if (chess.isCheckmate())               { newStatus = "finished"; winnerId = userId; endReason = "checkmate"; }
+  else if (chess.isStalemate())          { newStatus = "finished"; endReason = "stalemate"; }
   else if (chess.isThreefoldRepetition()){ newStatus = "finished"; endReason = "repetition"; }
   else if (chess.isInsufficientMaterial()){ newStatus = "finished"; endReason = "insufficient_material"; }
-  else if (chess.isDraw())              { newStatus = "finished"; endReason = "draw"; }
+  else if (chess.isDraw())               { newStatus = "finished"; endReason = "draw"; }
 
-  // ─── Timebank bonus ───────────────────────────────────────────────────────
-  const bonusAwarded = newMoveNumber % TIMEBANK_BONUS_INTERVAL === 0;
+  const bonusAwarded  = newMoveNumber % TIMEBANK_BONUS_INTERVAL === 0;
+  const timebankField = isPlayer1 ? "player1Timebank" : "player2Timebank";
+  const otherField    = isPlayer1 ? "player2Timebank" : "player1Timebank";
 
-  // ─── Persist move — guarded on status:'active' (#5) ──────────────────────
-  // Using updateMany with a status guard prevents overwriting a game that was
-  // finished by a concurrent resign or timeout between our initial check and now.
-  //
-  // #6: Timebank overage is written as a Prisma `decrement` expression so the
-  // DB applies it atomically. Two concurrent requests cannot both read the same
-  // timebank value and write back a stale result.
-  const timebankField    = isPlayer1 ? "player1Timebank" : "player2Timebank";
-  const otherTimebankField = isPlayer1 ? "player2Timebank" : "player1Timebank";
-
+  // ─── Persist — guarded on status:'active' ────────────────────────────────
   const persistResult = await prisma.game.updateMany({
     where: { id: gameId, status: "active" },
     data: {
-      fen:         newFen,
-      lastMoveAt:  now,
-      lastMoveBy:  userId,
-      moveNumber:  newMoveNumber,
-      // Atomic decrement of overage from moving player's timebank (#6)
+      fen:        newFen,
+      lastMoveAt: now,
+      lastMoveBy: userId,
+      moveNumber: newMoveNumber,
       ...(overage > 0
         ? { [timebankField]: { decrement: overage } }
         : {}
       ),
-      // Bonus: add to both players' timebanks atomically
       ...(bonusAwarded
         ? {
-            [timebankField]:      { increment: bonusAwarded ? TIMEBANK_BONUS_AMOUNT - overage : 0 },
-            [otherTimebankField]: { increment: TIMEBANK_BONUS_AMOUNT },
+            [timebankField]: { increment: TIMEBANK_BONUS_AMOUNT - (overage > 0 ? overage : 0) },
+            [otherField]:    { increment: TIMEBANK_BONUS_AMOUNT },
           }
         : {}
       ),
@@ -198,13 +179,10 @@ export async function POST(
   });
 
   if (persistResult.count === 0) {
-    // Game was finished by a concurrent path (resign/timeout) — return 409.
-    // The client will receive the correct state via the socket game-update.
     return NextResponse.json({ error: "Game already finished" }, { status: 409 });
   }
 
-  // Re-fetch updated timebanks to include in the broadcast
-  // (we used expressions so we don't know the final values without a read)
+  // Re-fetch timebanks (we used expressions so the new values must be read back)
   const updatedGame = await prisma.game.findUnique({
     where:  { id: gameId },
     select: { player1Timebank: true, player2Timebank: true },
@@ -226,8 +204,8 @@ export async function POST(
   }
 
   // ─── Broadcast ────────────────────────────────────────────────────────────
-  const newTurn  = new DraftChess(newFen).turn();
-  const emitFn   = (global as any).emitToGame;
+  const newTurn = new DraftChess(newFen).turn();
+  const emitFn  = (global as any).emitToGame;
 
   if (emitFn) {
     const payload: any = {
@@ -268,12 +246,12 @@ export async function POST(
   }
 
   return NextResponse.json({
-    success:     true,
-    fen:         newFen,
-    moveNumber:  newMoveNumber,
+    success:    true,
+    fen:        newFen,
+    moveNumber: newMoveNumber,
     player1Timebank: player1TimebankFinal,
     player2Timebank: player2TimebankFinal,
-    turn:        newTurn,
+    turn:       newTurn,
     timebankBonusAwarded: bonusAwarded,
     ...(newStatus === "finished" && {
       status:   "finished",

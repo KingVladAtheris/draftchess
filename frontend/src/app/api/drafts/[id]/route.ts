@@ -1,24 +1,19 @@
 // src/app/api/drafts/[id]/route.ts
-//
-// FIX #18: Added length and structural validation for fen and name inputs
-// to prevent oversized payloads from being written to the database.
 
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+import { consume, draftLimiter } from "@/app/lib/rate-limit";
 
-// A valid draft FEN position has exactly 8 rows separated by '/'.
-// The suffix " w - - 0 1" adds 10 chars. Total reasonable max is ~100.
 const MAX_FEN_LENGTH  = 120;
 const MAX_NAME_LENGTH = 64;
 const VALID_FEN_CHARS = /^[rnbqkpRNBQKP1-8\/\s\-0]+$/;
 
 function isValidFenStructure(fen: string): boolean {
-  const parts = fen.split(' ');
+  const parts = fen.split(" ");
   if (parts.length < 1) return false;
-  const rows = parts[0].split('/');
+  const rows = parts[0].split("/");
   if (rows.length !== 8) return false;
-  // Each row must expand to exactly 8 squares
   for (const row of rows) {
     let count = 0;
     for (const ch of row) {
@@ -32,7 +27,7 @@ function isValidFenStructure(fen: string): boolean {
 }
 
 export async function POST(
-  request: Request,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const session = await auth();
@@ -49,7 +44,10 @@ export async function POST(
 
   const userId = parseInt(session.user.id);
 
-  let body;
+  const limited = await consume(draftLimiter, request, userId.toString());
+  if (limited) return limited;
+
+  let body: any;
   try {
     body = await request.json();
   } catch {
@@ -62,7 +60,6 @@ export async function POST(
     return NextResponse.json({ error: "Invalid fen or points" }, { status: 400 });
   }
 
-  // #18: length and format guards
   if (fen.length > MAX_FEN_LENGTH) {
     return NextResponse.json({ error: "FEN string too long" }, { status: 400 });
   }
@@ -84,7 +81,10 @@ export async function POST(
       return NextResponse.json({ error: "Invalid name" }, { status: 400 });
     }
     if (name.length > MAX_NAME_LENGTH) {
-      return NextResponse.json({ error: `Name must be ${MAX_NAME_LENGTH} characters or fewer` }, { status: 400 });
+      return NextResponse.json(
+        { error: `Name must be ${MAX_NAME_LENGTH} characters or fewer` },
+        { status: 400 }
+      );
     }
   }
 

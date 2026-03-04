@@ -1,23 +1,16 @@
 // app/api/game/[id]/place/route.ts
-//
-// FIX #4: Aux point deduction now uses a conditional updateMany with a
-// gte check on the point balance. Two concurrent requests for the same
-// player will both pass the JS-level validation (reading the same value),
-// but only one can win the DB-level race. The second sees count=0 and
-// returns 409.
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import {
-  expandFenRow,
-  compressFenRow,
-  hasIllegalBattery,
-  getPieceAt,
-  placePieceOnFen,
   buildCombinedDraftFen,
   maskOpponentAuxPlacements,
+  getPieceAt,
+  placePieceOnFen,
+  hasIllegalBattery,
 } from "@/app/lib/fen-utils";
+import { consume, placeLimiter } from "@/app/lib/rate-limit";
 
 const PIECE_VALUES: Record<string, number> = { P: 1, N: 3, B: 3, R: 5 };
 
@@ -33,6 +26,10 @@ export async function POST(
   const { id } = await params;
   const userId = parseInt(session.user.id);
   const gameId = parseInt(id);
+
+  const limited = await consume(placeLimiter, req, userId.toString());
+  if (limited) return limited;
+
   const { piece, square } = await req.json();
 
   if (!piece || !square) {
@@ -76,7 +73,6 @@ export async function POST(
     return NextResponse.json({ error: "Not enough auxiliary points" }, { status: 400 });
   }
 
-  // Validate square format
   const rank      = parseInt(square[1], 10);
   const fileIndex = square.charCodeAt(0) - "a".charCodeAt(0);
   if (isNaN(rank) || isNaN(fileIndex) || fileIndex < 0 || fileIndex > 7) {
@@ -88,11 +84,8 @@ export async function POST(
     return NextResponse.json({ error: "Can only place on own ranks" }, { status: 400 });
   }
 
-  if (piece.toUpperCase() === "P") {
-    const pawnRank = isWhite ? 2 : 7;
-    if (rank !== pawnRank) {
-      return NextResponse.json({ error: "Pawns can only be placed on the front rank" }, { status: 400 });
-    }
+  if (piece.toUpperCase() === "P" && rank !== (isWhite ? 2 : 7)) {
+    return NextResponse.json({ error: "Pawns can only be placed on the front rank" }, { status: 400 });
   }
 
   const currentFen = game.fen ?? "";
@@ -108,17 +101,13 @@ export async function POST(
     return NextResponse.json({ error: "Illegal battery — cannot place here" }, { status: 400 });
   }
 
-  // ── Atomic conditional update (#4) ────────────────────────────────────────
-  // The WHERE clause checks that points are still sufficient at the DB level.
-  // If two concurrent requests for the same player race here, only one will
-  // match the gte condition; the other sees count=0.
+  // ── Atomic conditional update ─────────────────────────────────────────────
   const pointsField = isPlayer1 ? "auxPointsPlayer1" : "auxPointsPlayer2";
 
   const updateResult = await prisma.game.updateMany({
     where: {
       id:     gameId,
       status: "prep",
-      // DB-level guard: points must still cover the cost
       ...(isPlayer1
         ? { auxPointsPlayer1: { gte: value } }
         : { auxPointsPlayer2: { gte: value } }),
@@ -136,7 +125,6 @@ export async function POST(
     );
   }
 
-  // Re-fetch to get accurate updated point values for broadcast
   const updatedGame = await prisma.game.findUnique({
     where:  { id: gameId },
     select: { auxPointsPlayer1: true, auxPointsPlayer2: true },
@@ -155,8 +143,8 @@ export async function POST(
       auxPointsPlayer2: updatedGame?.auxPointsPlayer2,
     });
 
-    const opponentId       = isPlayer1 ? game.player2Id : game.player1Id;
-    const opponentIsWhite  = !isWhite;
+    const opponentId        = isPlayer1 ? game.player2Id : game.player1Id;
+    const opponentIsWhite   = !isWhite;
     const opponentMaskedFen = maskOpponentAuxPlacements(newFen, originalFen, opponentIsWhite);
     emitToGameUser(gameId, opponentId, "game-update", {
       fen: opponentMaskedFen,

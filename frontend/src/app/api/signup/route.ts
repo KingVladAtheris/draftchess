@@ -1,12 +1,14 @@
 // src/app/api/signup/route.ts
-//
-// FIX #15: Error message no longer distinguishes between "email taken" and
-// "username taken", preventing enumeration of registered accounts.
 
 import { prisma } from "@/app/lib/prisma.server";
 import bcrypt from "bcrypt";
+import { NextRequest } from "next/server";
+import { consume, signupLimiter } from "@/app/lib/rate-limit";
 
-export async function POST(request: Request) {
+export async function POST(request: NextRequest) {
+  const limited = await consume(signupLimiter, request); // keyed by IP — user not yet known
+  if (limited) return limited;
+
   try {
     const { email, username, password } = await request.json();
 
@@ -17,7 +19,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Basic length guards
     if (username.length < 2 || username.length > 32) {
       return new Response(
         JSON.stringify({ error: "Username must be between 2 and 32 characters" }),
@@ -30,7 +31,6 @@ export async function POST(request: Request) {
     });
 
     if (existingUser) {
-      // #15: generic message — do not reveal which field is taken
       return new Response(
         JSON.stringify({ error: "An account with those details already exists" }),
         { status: 409 }

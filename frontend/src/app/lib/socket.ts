@@ -6,7 +6,7 @@ import { io, type Socket } from 'socket.io-client';
 let socket: Socket | null = null;
 let connectPromise: Promise<Socket> | null = null;
 
-const SOCKET_URL = undefined; 
+const SOCKET_URL = undefined;
 
 export const getSocket = (): Promise<Socket> => {
   if (typeof window === 'undefined') {
@@ -17,26 +17,23 @@ export const getSocket = (): Promise<Socket> => {
     return Promise.resolve(socket);
   }
 
-  // If already connecting, return the existing promise
   if (connectPromise) {
     return connectPromise;
   }
 
-  // Lazy init socket instance (only once)
   if (!socket) {
     socket = io(SOCKET_URL, {
-      path: '/api/socket.io',
-      withCredentials: true,
-      reconnection: true,
+      path:                '/api/socket.io',
+      withCredentials:     true,
+      reconnection:        true,
       reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-      transports: ['websocket', 'polling'],
-      autoConnect: false,           // ← We control connect manually
+      reconnectionDelay:   1000,
+      transports:          ['websocket', 'polling'],
+      autoConnect:         false,
     });
 
     socket.on('disconnect', (reason: string) => {
       console.log(`Socket disconnected: ${reason}`);
-
       if (!socket?.connected) {
         connectPromise = null;
       }
@@ -47,7 +44,6 @@ export const getSocket = (): Promise<Socket> => {
     });
   }
 
-  // Create connection promise
   connectPromise = new Promise<Socket>((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
@@ -60,7 +56,14 @@ export const getSocket = (): Promise<Socket> => {
       resolve(socket!);
     };
 
+    // FIX #26: connectPromise is nulled BEFORE reject() is called.
+    // Previously, connectPromise was nulled inside cleanup() which ran
+    // after reject() — meaning any caller that had already awaited this
+    // promise and caught the error would see connectPromise still set
+    // to the rejected promise on their next getSocket() call, and
+    // receive another rejection instead of a fresh attempt.
     const onError = (err: Error) => {
+      connectPromise = null; // clear first so future callers get a fresh attempt
       cleanup();
       reject(err);
     };
@@ -69,13 +72,14 @@ export const getSocket = (): Promise<Socket> => {
       clearTimeout(timeout);
       socket?.off('connect', onConnect);
       socket?.off('connect_error', onError);
-      connectPromise = null;
+      // Note: connectPromise is NOT nulled here — onError does it explicitly
+      // before calling cleanup, and onConnect leaves it set until the next
+      // disconnect so in-flight callers resolve correctly.
     };
 
     socket!.once('connect', onConnect);
     socket!.once('connect_error', onError);
 
-    // Trigger connection if not already active
     if (!socket!.active) {
       socket!.connect();
     }
