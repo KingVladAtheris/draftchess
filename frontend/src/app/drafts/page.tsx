@@ -5,10 +5,9 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 
-// Define the shape of each draft item (now includes name)
 type DraftOverviewItem = {
   id: number;
-  name: string | null;     // ← added
+  name: string | null;
   fen: string;
   points: number;
   updatedAt: Date;
@@ -30,12 +29,20 @@ async function createNewDraft() {
       userId,
       fen: "8/8/8/8/8/8/8/4K3 w - - 0 1",
       points: 0,
-      // name: null,  // optional – user sets it later
+      // name: null — user sets it in the editor
     },
   });
 
   revalidatePath("/drafts");
   redirect(`/drafts/${newDraft.id}`);
+}
+
+function timeAgo(date: Date) {
+  const d = Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
+  if (d === 0) return "Today";
+  if (d === 1) return "Yesterday";
+  if (d < 7)  return `${d}d ago`;
+  return new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 export default async function DraftsOverview() {
@@ -45,70 +52,102 @@ export default async function DraftsOverview() {
   const userId = parseInt(session.user.id);
 
   const drafts: DraftOverviewItem[] = await prisma.draft.findMany({
-    where: { userId },
+    where:   { userId },
     orderBy: { updatedAt: "desc" },
-    select: {
-      id: true,
-      name: true,          // ← added this
-      fen: true,
-      points: true,
-      updatedAt: true,
-      createdAt: true,
-    },
+    select:  { id: true, name: true, fen: true, points: true, updatedAt: true, createdAt: true },
   });
 
   return (
-    <div className="min-h-screen bg-gray-100 p-8">
-      <h1 className="text-4xl font-bold mb-8">My Drafts</h1>
+    <div className="max-w-4xl mx-auto px-4 md:px-8 py-10">
 
-      <div className="mb-10">
-        <form action={createNewDraft}>
-          <button
-            type="submit"
-            className="px-6 py-3 bg-green-600 text-white rounded hover:bg-green-700"
-          >
-            + New Draft
-          </button>
-        </form>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h1 className="font-display text-3xl font-800 text-white">My Drafts</h1>
+          <p className="text-white/45 text-sm mt-1">
+            {drafts.length === 0
+              ? "No drafts yet"
+              : `${drafts.length} draft${drafts.length !== 1 ? "s" : ""}`}
+          </p>
+        </div>
+        {drafts.length > 0 && (
+          <form action={createNewDraft}>
+            <button type="submit" className="btn-primary py-2.5 px-5 text-sm">
+              + New draft
+            </button>
+          </form>
+        )}
       </div>
 
+      {/* Empty state */}
       {drafts.length === 0 ? (
-        <p className="text-gray-600">You don't have any saved drafts yet. Create one!</p>
+        <div className="flex flex-col items-center justify-center py-24 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-3xl mb-5">
+            ♟
+          </div>
+          <h3 className="font-display text-xl font-700 text-white mb-2">No drafts yet</h3>
+          <p className="text-white/45 text-sm mb-8 max-w-xs leading-relaxed">
+            Create your first draft to start building a custom army. You get 33 points to spend.
+          </p>
+          <form action={createNewDraft}>
+            <button type="submit" className="btn-primary">
+              Create your first draft
+            </button>
+          </form>
+        </div>
       ) : (
-        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {drafts.map((draft) => (
-            <div key={draft.id} className="bg-white p-6 rounded-lg shadow">
-              {/* Use name if available, fallback to ID */}
-              <p className="font-semibold mb-2 text-lg">
-                {draft.name || `Draft #${draft.id}`}
-              </p>
+            <div
+              key={draft.id}
+              className="group relative p-5 rounded-2xl border border-white/8 bg-white/[0.02] hover:bg-white/[0.05] hover:border-amber-500/20 transition-all duration-200"
+            >
+              {/* Full-card edit link sits behind the delete button */}
+              <Link
+                href={`/drafts/${draft.id}`}
+                className="absolute inset-0 rounded-2xl"
+                aria-label={`Edit ${draft.name || `Draft #${draft.id}`}`}
+              />
 
-              <p className="text-sm text-gray-600 mb-4">
-                Last updated: {new Date(draft.updatedAt).toLocaleDateString()}
-              </p>
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <h3 className="font-display font-600 text-white group-hover:text-amber-400 transition-colors truncate text-base">
+                  {draft.name || `Draft #${draft.id}`}
+                </h3>
+                <span className="text-xs text-white/30 flex-shrink-0 mt-0.5">
+                  {timeAgo(draft.updatedAt)}
+                </span>
+              </div>
 
-              <p className="mb-4">Points used: {draft.points}</p>
+              {/* Point bar */}
+              <div className="flex items-center gap-2 mb-3">
+                <div className="flex-1 h-0.5 rounded-full bg-white/8 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-amber-400/70"
+                    style={{ width: `${Math.min(100, (draft.points / 33) * 100)}%` }}
+                  />
+                </div>
+                <span className="text-xs text-white/35 tabular-nums flex-shrink-0">
+                  {draft.points}/33
+                </span>
+              </div>
 
-              <div className="flex gap-4">
-                <Link
-                  href={`/drafts/${draft.id}`}
-                  className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-                >
-                  Edit
-                </Link>
-
+              {/* Delete — z-index above card link */}
+              <div className="relative z-10 flex justify-end">
                 <form
                   action={async () => {
                     "use server";
-                    await prisma.draft.delete({
-                      where: { id: draft.id },
+                    const s = await auth();
+                    if (!s?.user?.id) return;
+                    // ownership check: deleteMany with userId guard
+                    await prisma.draft.deleteMany({
+                      where: { id: draft.id, userId: parseInt(s.user.id) },
                     });
                     revalidatePath("/drafts");
                   }}
                 >
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+                    className="text-xs text-white/20 hover:text-red-400 transition-colors px-2 py-1 rounded"
                   >
                     Delete
                   </button>

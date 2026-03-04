@@ -7,7 +7,7 @@ import { consume, draftLimiter } from "@/app/lib/rate-limit";
 
 const MAX_FEN_LENGTH  = 120;
 const MAX_NAME_LENGTH = 64;
-const VALID_FEN_CHARS = /^[rnbqkpRNBQKP1-8\/\s\-0]+$/;
+const VALID_FEN_CHARS = /^[rnbqkpRNBQKP1-8\/]+ [wb] - - \d+ \d+$/;
 
 function isValidFenStructure(fen: string): boolean {
   const parts = fen.split(" ");

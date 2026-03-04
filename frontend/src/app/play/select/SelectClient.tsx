@@ -1,258 +1,204 @@
 // src/app/play/select/SelectClient.tsx
-'use client';
+// Z-pattern: draft list left, queue panel sticky right.
+// One decision (which draft), one action (queue). Nothing else.
+"use client";
 
-import { useState, useEffect, useRef } from 'react';
-import { getSocket } from '@/app/lib/socket';
+import { useState, useEffect, useRef } from "react";
+import { getSocket } from "@/app/lib/socket";
 
-type DraftSelectItem = {
-  id: number;
-  name: string | null;
-  points: number;
-  updatedAt: Date;
-};
+type Draft = { id: number; name: string | null; points: number; updatedAt: Date; };
 
-type SelectClientProps = {
-  drafts: DraftSelectItem[];
-};
+function timeAgo(date: Date) {
+  const d = Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
+  if (d === 0) return "Today";
+  if (d === 1) return "Yesterday";
+  if (d < 7)  return `${d}d ago`;
+  return new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
 
-export default function SelectClient({ drafts }: SelectClientProps) {
-  const [selectedDraftId, setSelectedDraftId] = useState<number | null>(null);
-  const [isQueuing, setIsQueuing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function DraftOption({ draft, selected, disabled, onSelect }: {
+  draft: Draft; selected: boolean; disabled: boolean; onSelect: () => void;
+}) {
+  const pct = Math.min(100, (draft.points / 33) * 100);
+  return (
+    <button
+      onClick={onSelect}
+      disabled={disabled}
+      className={`w-full text-left p-4 rounded-xl border transition-all duration-200
+        ${disabled ? "opacity-60 cursor-not-allowed" :
+          selected ? "border-amber-500/50 bg-amber-500/8 cursor-pointer" :
+          "border-white/8 bg-white/[0.02] hover:border-white/18 hover:bg-white/[0.05] cursor-pointer"}`}
+    >
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <span className={`font-display font-600 text-sm truncate ${selected ? "text-amber-400" : "text-white/80"}`}>
+          {draft.name || `Draft #${draft.id}`}
+        </span>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {selected && <span className="w-4 h-4 rounded-full bg-amber-400 flex items-center justify-center text-[9px] text-[#0f1117] font-bold">✓</span>}
+          <span className="text-xs text-white/30">{timeAgo(draft.updatedAt)}</span>
+        </div>
+      </div>
+      <div className="h-0.5 rounded-full bg-white/8 overflow-hidden mb-2">
+        <div className={`h-full rounded-full ${selected ? "bg-amber-400" : "bg-white/25"}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-xs text-white/35">{draft.points}/33 pts</span>
+    </button>
+  );
+}
 
-  // Track whether WE initiated the leave so the unmount cleanup
-  // doesn't fire a redundant /api/queue/leave after an explicit leave.
-  const didLeaveRef = useRef(false);
-  // Track queuing in a ref as well so the async unmount cleanup can read
-  // the latest value without a stale closure.
-  const isQueuingRef = useRef(false);
+function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave }: {
+  selectedDraft: Draft | null; isQueuing: boolean; onQueue: () => void; onLeave: () => void;
+}) {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef<number | null>(null);
 
-  // ─── Sync isQueuing → ref ────────────────────────────────────────────────
   useEffect(() => {
-    isQueuingRef.current = isQueuing;
+    if (!isQueuing) { setElapsed(0); startRef.current = null; return; }
+    startRef.current = Date.now();
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startRef.current!) / 1000)), 1000);
+    return () => clearInterval(t);
   }, [isQueuing]);
 
-  // ─── Restore queue state on mount ────────────────────────────────────────
-  // If the user was already queued (navigated away and came back), pick up
-  // where they left off — show the Leave Queue button and re-attach the
-  // matched socket listener.
+  const fmt = (s: number) => { const m = Math.floor(s/60); return m > 0 ? `${m}:${(s%60).toString().padStart(2,"0")}` : `${s}s`; };
+
+  return (
+    <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-6 flex flex-col gap-5">
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-wider text-white/35 mb-3">Playing with</p>
+        {selectedDraft ? (
+          <div className="flex items-center gap-3 p-3 rounded-xl bg-white/[0.04] border border-white/8">
+            <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-amber-400 text-xl flex-shrink-0">♟</div>
+            <div className="min-w-0">
+              <p className="text-sm font-600 font-display text-white truncate">{selectedDraft.name || `Draft #${selectedDraft.id}`}</p>
+              <p className="text-xs text-white/35">{selectedDraft.points}/33 pts</p>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-3 p-3 rounded-xl bg-white/[0.02] border border-dashed border-white/10">
+            <div className="w-9 h-9 rounded-lg bg-white/5 flex items-center justify-center text-white/20 text-xl flex-shrink-0">?</div>
+            <p className="text-sm text-white/30 italic">No draft selected</p>
+          </div>
+        )}
+      </div>
+
+      {isQueuing && (
+        <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-amber-500/8 border border-amber-500/20">
+          <div className="flex gap-0.5 items-end h-4">
+            {[0,1,2].map(i => (
+              <div key={i} className="w-1 rounded-full bg-amber-400 animate-bounce" style={{ height: "100%", animationDelay: `${i*0.15}s` }} />
+            ))}
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-amber-400">Searching for opponent</p>
+            <p className="text-xs text-amber-400/50 tabular-nums">{fmt(elapsed)}</p>
+          </div>
+        </div>
+      )}
+
+      {isQueuing ? (
+        <button onClick={onLeave} className="btn-danger w-full py-3">Leave Queue</button>
+      ) : (
+        <button onClick={onQueue} disabled={!selectedDraft} className="btn-primary w-full py-3 disabled:opacity-40 disabled:cursor-not-allowed">
+          Find a match
+        </button>
+      )}
+
+      {!isQueuing && !selectedDraft && (
+        <p className="text-xs text-white/30 text-center -mt-2">Select a draft to continue</p>
+      )}
+    </div>
+  );
+}
+
+export default function SelectClient({ drafts }: { drafts: Draft[] }) {
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [isQueuing, setIsQueuing]   = useState(false);
+  const [error, setError]           = useState<string | null>(null);
+  const didLeaveRef                 = useRef(false);
+  const isQueuingRef                = useRef(false);
+
+  useEffect(() => { isQueuingRef.current = isQueuing; }, [isQueuing]);
+
   useEffect(() => {
     let mounted = true;
-
-    const restore = async () => {
-      try {
-        const res = await fetch('/api/queue/status');
-        if (!res.ok) return;
-        const data = await res.json();
-
-        // Already matched — go straight to the game
-        if (data.matched && data.gameId) {
-          window.location.href = `/play/game/${data.gameId}`;
-          return;
-        }
-
-        // Was queued before navigating away — restore UI and re-attach socket
-        if (data.status === 'queued' && mounted) {
-          setIsQueuing(true);
-          attachMatchedListener();
-        }
-      } catch {
-        // Non-fatal — user just starts fresh
-      }
-    };
-
-    restore();
+    fetch("/api/queue/status").then(r => r.ok ? r.json() : null).then(data => {
+      if (!mounted || !data) return;
+      if (data.matched && data.gameId) { window.location.href = `/play/game/${data.gameId}`; return; }
+      if (data.status === "queued") { setIsQueuing(true); attachSocket(); }
+    }).catch(() => {});
     return () => { mounted = false; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ─── Cleanup on unmount (page navigation) ────────────────────────────────
-  // If the user navigates away while still queued, remove them from the queue.
-  // keepalive: true ensures the fetch completes even after the component
-  // unmounts / the page starts navigating away.
   useEffect(() => {
     return () => {
       if (isQueuingRef.current && !didLeaveRef.current) {
-        fetch('/api/queue/leave', { method: 'POST', keepalive: true }).catch(() => {});
-        getSocket()
-          .then(socket => socket.emit('leave-queue'))
-          .catch(() => {});
+        fetch("/api/queue/leave", { method: "POST", keepalive: true }).catch(() => {});
+        getSocket().then(s => s.emit("leave-queue")).catch(() => {});
       }
     };
-  }, []); // runs only on unmount
+  }, []);
 
-  // ─── Attach socket matched listener ──────────────────────────────────────
-  function attachMatchedListener() {
-    getSocket()
-      .then(socket => {
-        socket.emit('join-queue');
-
-        // Remove any previous listener before adding to avoid duplicates
-        socket.off('matched');
-        socket.on('matched', (data: { gameId: number }) => {
-          console.log('Match found! Game ID:', data.gameId);
-          didLeaveRef.current = true; // don't call leave on unmount
-          setIsQueuing(false);
-          window.location.href = `/play/game/${data.gameId}`;
-        });
-
-        socket.off('queue-error');
-        socket.on('queue-error', (msg: string) => {
-          setError(msg);
-          setIsQueuing(false);
-        });
-      })
-      .catch(err => {
-        console.error('Socket error:', err);
-        setError('Could not connect to matchmaking server');
-        setIsQueuing(false);
+  function attachSocket() {
+    getSocket().then(socket => {
+      socket.emit("join-queue");
+      socket.off("matched");
+      socket.on("matched", (data: { gameId: number }) => {
+        didLeaveRef.current = true; setIsQueuing(false);
+        window.location.href = `/play/game/${data.gameId}`;
       });
+      socket.off("queue-error");
+      socket.on("queue-error", (msg: string) => { setError(msg); setIsQueuing(false); });
+    }).catch(() => { setError("Could not connect to matchmaking server"); setIsQueuing(false); });
   }
 
-  // ─── Join queue ───────────────────────────────────────────────────────────
   const handleQueue = async () => {
-    if (!selectedDraftId || isQueuing) return;
+    if (!selectedId || isQueuing) return;
     setError(null);
-
     try {
-      const res = await fetch('/api/queue/join', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ draftId: selectedDraftId }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Failed to join queue');
-      }
-
-      didLeaveRef.current = false;
-      setIsQueuing(true);
-      attachMatchedListener();
-    } catch (err: any) {
-      console.error('Queue error:', err);
-      setError(err.message || 'Something went wrong');
-    }
+      const res = await fetch("/api/queue/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ draftId: selectedId }) });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to join queue"); }
+      didLeaveRef.current = false; setIsQueuing(true); attachSocket();
+    } catch (e: any) { setError(e.message); }
   };
 
-  // ─── Leave queue ──────────────────────────────────────────────────────────
-  const handleLeaveQueue = async () => {
-    didLeaveRef.current = true; // prevent unmount cleanup from double-firing
-    setIsQueuing(false);
-    setError(null);
-
-    try {
-      await fetch('/api/queue/leave', { method: 'POST' });
-    } catch (err) {
-      console.error('Leave queue error:', err);
-    }
-
-    getSocket()
-      .then(socket => {
-        socket.emit('leave-queue');
-        socket.off('matched');
-        socket.off('queue-error');
-      })
-      .catch(() => {});
+  const handleLeave = async () => {
+    didLeaveRef.current = true; setIsQueuing(false);
+    await fetch("/api/queue/leave", { method: "POST" }).catch(() => {});
+    getSocket().then(s => { s.emit("leave-queue"); s.off("matched"); s.off("queue-error"); }).catch(() => {});
   };
 
-  const selectedDraft = drafts.find(d => d.id === selectedDraftId);
-
-  // ─── Render ───────────────────────────────────────────────────────────────
   return (
-    <>
-      {/* Action area */}
-      <div className="mb-10 text-center">
-        {isQueuing ? (
-          <div className="flex flex-col items-center gap-4">
-            {/* Spinner + status */}
-            <div className="flex items-center gap-3 text-purple-700 font-medium text-lg">
-              <svg
-                className="animate-spin h-5 w-5 text-purple-600"
-                xmlns="http://www.w3.org/2000/svg"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-              </svg>
-              Searching for opponent...
+    <div className="max-w-5xl mx-auto px-4 md:px-8 py-10">
+      <div className="mb-8">
+        <h1 className="font-display text-3xl font-800 text-white">Find a match</h1>
+        <p className="text-white/45 text-sm mt-1">Choose a draft, then search for an opponent.</p>
+      </div>
+
+      {error && (
+        <div className="mb-6 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">{error}</div>
+      )}
+
+      <div className="flex flex-col lg:flex-row gap-6 items-start">
+        <div className={`flex-1 min-w-0 transition-opacity duration-200 ${isQueuing ? "opacity-50 pointer-events-none" : ""}`}>
+          <p className="text-xs font-semibold uppercase tracking-wider text-white/35 mb-3">Your drafts</p>
+          {drafts.length === 0 ? (
+            <div className="flex flex-col items-center py-16 text-center rounded-2xl border border-dashed border-white/10">
+              <p className="text-white/40 text-sm mb-4">No drafts yet.</p>
+              <a href="/drafts" className="btn-secondary py-2 px-5 text-sm">Create a draft</a>
             </div>
+          ) : (
+            <div className="grid gap-2 sm:grid-cols-2">
+              {drafts.map(draft => (
+                <DraftOption key={draft.id} draft={draft} selected={selectedId === draft.id} disabled={isQueuing} onSelect={() => setSelectedId(draft.id)} />
+              ))}
+            </div>
+          )}
+        </div>
 
-            {selectedDraft && (
-              <p className="text-sm text-gray-500">
-                Playing with{' '}
-                <span className="font-semibold text-gray-700">
-                  {selectedDraft.name || `Draft #${selectedDraft.id}`}
-                </span>
-              </p>
-            )}
-
-            <button
-              onClick={handleLeaveQueue}
-              className="px-8 py-3 bg-red-100 text-red-700 border border-red-300 rounded-lg hover:bg-red-200 font-semibold transition"
-            >
-              Leave Queue
-            </button>
-          </div>
-        ) : (
-          <button
-            disabled={!selectedDraftId}
-            onClick={handleQueue}
-            className={`px-12 py-5 text-white text-2xl rounded-lg transition ${
-              selectedDraftId
-                ? 'bg-purple-600 hover:bg-purple-700'
-                : 'bg-gray-400 cursor-not-allowed'
-            }`}
-          >
-            Queue for Match
-          </button>
-        )}
-
-        {error && (
-          <p className="mt-3 text-red-600 text-sm">{error}</p>
-        )}
+        <div className="w-full lg:w-72 flex-shrink-0 lg:sticky lg:top-20">
+          <QueuePanel selectedDraft={drafts.find(d => d.id === selectedId) ?? null} isQueuing={isQueuing} onQueue={handleQueue} onLeave={handleLeave} />
+        </div>
       </div>
-
-      {/* Draft list */}
-      <div className={`bg-white rounded-lg shadow p-6 max-h-[60vh] overflow-y-auto transition ${isQueuing ? 'opacity-50 pointer-events-none' : ''}`}>
-        {drafts.length === 0 ? (
-          <p className="text-center text-gray-500 py-8">
-            No drafts available. Create one first!
-          </p>
-        ) : (
-          <div className="grid gap-4 md:grid-cols-2">
-            {drafts.map((draft) => {
-              const isSelected = selectedDraftId === draft.id;
-              return (
-                <div
-                  key={draft.id}
-                  onClick={() => { if (!isQueuing) setSelectedDraftId(draft.id); }}
-                  className={`p-6 border-2 rounded-lg transition relative ${
-                    isQueuing
-                      ? isSelected
-                        ? 'border-purple-400 bg-purple-50'
-                        : 'border-gray-200 bg-gray-50'
-                      : isSelected
-                        ? 'border-purple-600 bg-purple-50 shadow-lg cursor-pointer'
-                        : 'border-gray-200 hover:border-purple-400 hover:bg-gray-50 cursor-pointer'
-                  }`}
-                >
-                  {isSelected && (
-                    <div className="absolute top-2 right-2 text-purple-600 text-2xl">✓</div>
-                  )}
-                  <h3 className="font-bold text-lg mb-2">
-                    {draft.name || `Draft #${draft.id}`}
-                  </h3>
-                  <p className="text-sm text-gray-600 mb-2">Points used: {draft.points}</p>
-                  <p className="text-xs text-gray-500">
-                    Last updated: {new Date(draft.updatedAt).toLocaleDateString()}
-                  </p>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </>
+    </div>
   );
 }
