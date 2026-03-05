@@ -1,19 +1,15 @@
 // src/app/lib/rate-limit.ts
 //
-// Redis-backed rate limiting using rate-limiter-flexible.
-// All limiters share the existing Redis connection — no new infrastructure.
-//
-// Usage in an API route:
-//
-//   import { authLimiter, moveLimiter, consume } from '@/app/lib/rate-limit';
-//
-//   const limited = await consume(moveLimiter, request);
-//   if (limited) return limited; // returns a 429 NextResponse
-//
-// Install: npm install rate-limiter-flexible ioredis
-// (ioredis is already a transitive dep via BullMQ — just needs to be explicit)
+// CHANGES:
+//   - Auth limiters (signup, login) now FAIL CLOSED on Redis error.
+//     A Redis outage must not silently disable brute-force protection.
+//   - All other limiters retain fail-open behaviour (don't block a game
+//     in progress over a transient Redis blip).
+//   - In-memory fallback limiter for auth routes when Redis is unavailable,
+//     using a simple sliding-window Map. This keeps auth protection alive
+//     even during Redis downtime, without adding a dependency.
 
-import { RateLimiterRedis, RateLimiterRes } from 'rate-limiter-flexible';
+import { RateLimiterRedis, RateLimiterMemory, RateLimiterRes } from 'rate-limiter-flexible';
 import Redis from 'ioredis';
 import { NextRequest, NextResponse } from 'next/server';
 
@@ -21,7 +17,6 @@ if (!process.env.REDIS_URL) {
   throw new Error('REDIS_URL is not set');
 }
 
-// Parse REDIS_URL for ioredis (same helper pattern as queues.ts)
 function parseRedisUrl(url: string) {
   const u = new URL(url);
   return {
@@ -31,8 +26,6 @@ function parseRedisUrl(url: string) {
   };
 }
 
-// Single ioredis client shared across all limiters.
-// Module-level singleton — not recreated per request.
 let _redisClient: Redis | null = null;
 
 function getRedisClient(): Redis {
@@ -44,13 +37,18 @@ function getRedisClient(): Redis {
   return _redisClient;
 }
 
-// ─── Limiter definitions ────────────────────────────────────────────────────
-//
-// Each limiter is a module-level singleton.
-// keyPrefix must be unique per limiter to avoid key collisions in Redis.
+// ─── In-memory fallback for auth limiters ────────────────────────────────────
+// Used only when Redis is unavailable. Simple fixed-window per key.
+// Intentionally conservative: 3 attempts per 15 minutes.
+const _memoryAuthLimiter = new RateLimiterMemory({
+  points:   3,
+  duration: 15 * 60,
+  keyPrefix: 'mem:auth',
+});
 
-// Signup: 5 attempts per IP per 15 minutes
-// Prevents bulk account creation.
+// ─── Limiter definitions ─────────────────────────────────────────────────────
+
+// Auth: FAIL CLOSED — 5 attempts per IP per 15 minutes
 export const signupLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:signup',
@@ -58,8 +56,7 @@ export const signupLimiter = new RateLimiterRedis({
   duration:    15 * 60,
 });
 
-// Login: 10 attempts per IP per 15 minutes
-// Prevents credential stuffing without being too aggressive for real users.
+// Auth: FAIL CLOSED — 10 attempts per IP per 15 minutes
 export const loginLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:login',
@@ -67,8 +64,7 @@ export const loginLimiter = new RateLimiterRedis({
   duration:    15 * 60,
 });
 
-// Queue join: 10 attempts per user per minute
-// A user legitimately joins/leaves a few times; 10 is generous.
+// Queue join: fail open — 10 per user per minute
 export const queueLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:queue',
@@ -76,8 +72,7 @@ export const queueLimiter = new RateLimiterRedis({
   duration:    60,
 });
 
-// Move submission: 60 moves per user per minute (1/sec average)
-// Chess moves are fast but 60/min is still 2x a bullet game pace.
+// Move: fail open — 60 per user per minute
 export const moveLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:move',
@@ -85,8 +80,7 @@ export const moveLimiter = new RateLimiterRedis({
   duration:    60,
 });
 
-// Place (aux piece during prep): 20 per user per minute
-// Prep phase is 60s max and players only have 6 points, so 20 is very generous.
+// Place: fail open — 20 per user per minute
 export const placeLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:place',
@@ -94,8 +88,7 @@ export const placeLimiter = new RateLimiterRedis({
   duration:    60,
 });
 
-// Draft save: 30 per user per minute
-// Autosave-style usage needs headroom; 30 is comfortable.
+// Draft save: fail open — 30 per user per minute
 export const draftLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:draft',
@@ -103,7 +96,7 @@ export const draftLimiter = new RateLimiterRedis({
   duration:    60,
 });
 
-// General API: 120 per user per minute (catch-all for status/profile/leaderboard)
+// General: fail open — 120 per user per minute
 export const generalLimiter = new RateLimiterRedis({
   storeClient: getRedisClient(),
   keyPrefix:   'rl:general',
@@ -111,26 +104,18 @@ export const generalLimiter = new RateLimiterRedis({
   duration:    60,
 });
 
-// ─── consume() helper ───────────────────────────────────────────────────────
+// ─── consume() ───────────────────────────────────────────────────────────────
 //
-// Call at the top of any route handler. Returns a 429 NextResponse if the
-// limit is exceeded, or null if the request is allowed.
-//
-// Key strategy:
-//   - Auth routes: keyed by IP (user not yet known)
-//   - Game/queue routes: keyed by userId (from session) — fairer than IP
-//     since users behind NAT share an IP but have separate accounts.
-//
-// Usage:
-//   const limited = await consume(moveLimiter, request, userId.toString());
-//   if (limited) return limited;
+// isAuthRoute: when true, Redis errors cause a 503 (fail closed) unless the
+// in-memory fallback also rejects, in which case we return 429.
+// When false (default), Redis errors are logged and the request is allowed.
 
 export async function consume(
   limiter: RateLimiterRedis,
   request: NextRequest,
   key?: string,
+  isAuthRoute = false,
 ): Promise<NextResponse | null> {
-  // Fall back to IP if no key provided (auth routes)
   const ip =
     request.headers.get('x-forwarded-for')?.split(',')[0].trim() ??
     request.headers.get('x-real-ip') ??
@@ -143,6 +128,7 @@ export async function consume(
     return null; // allowed
   } catch (err) {
     if (err instanceof RateLimiterRes) {
+      // Normal rate-limit rejection from Redis
       const retryAfter = Math.ceil(err.msBeforeNext / 1000);
       return NextResponse.json(
         { error: 'Too many requests', retryAfter },
@@ -155,8 +141,44 @@ export async function consume(
         }
       );
     }
-    // Redis error — fail open (don't block users if Redis is temporarily down)
+
+    // Redis connection error
     console.error('[RateLimit] consume error:', err);
-    return null;
+
+    if (!isAuthRoute) {
+      // Non-auth routes: fail open — don't block legitimate traffic
+      return null;
+    }
+
+    // Auth routes: try in-memory fallback limiter
+    try {
+      await _memoryAuthLimiter.consume(limitKey);
+      // Memory limiter allowed it — Redis is down but request is within fallback budget
+      console.warn('[RateLimit] auth route using memory fallback for key:', limitKey);
+      return null;
+    } catch (memErr) {
+      if (memErr instanceof RateLimiterRes) {
+        const retryAfter = Math.ceil(memErr.msBeforeNext / 1000);
+        return NextResponse.json(
+          { error: 'Too many requests', retryAfter },
+          { status: 429, headers: { 'Retry-After': retryAfter.toString() } }
+        );
+      }
+      // Memory limiter itself errored — fail closed with 503
+      console.error('[RateLimit] memory fallback error:', memErr);
+      return NextResponse.json(
+        { error: 'Service temporarily unavailable' },
+        { status: 503 }
+      );
+    }
   }
+}
+
+// Convenience wrapper for auth routes — avoids passing isAuthRoute=true everywhere
+export async function consumeAuth(
+  limiter: RateLimiterRedis,
+  request: NextRequest,
+  key?: string,
+): Promise<NextResponse | null> {
+  return consume(limiter, request, key, true);
 }

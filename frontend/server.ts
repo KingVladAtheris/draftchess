@@ -1,11 +1,12 @@
 // frontend/server.ts
 //
 // CHANGES from previous version:
-//   - Socket disconnect handler now instantly removes the user from the queue
-//     (sets queueStatus='offline') if they were queued but not in a game.
-//     No grace period — there is nothing to protect in the queue state.
-//   - The game presence grace period (DISCONNECT_GRACE_SECS) is unchanged —
-//     that still applies only to active/prep games.
+//   - Game events subscriber now applies per-player FEN masking during prep phase.
+//     When a game-update arrives with a FEN while game status is 'prep', we fetch
+//     the draft FENs and emit a masked version to each player individually via
+//     game-{gameId}-user-{userId} rooms instead of broadcasting to the whole
+//     game-{gameId} room unmasked.
+//   - All other behaviour unchanged.
 
 import { createServer } from 'http';
 import { parse } from 'url';
@@ -28,20 +29,11 @@ if (!REDIS_URL) {
   process.exit(1);
 }
 
-// Parse the DB index from the URL so keyspace notifications fire on the
-// correct database regardless of deployment config. (#9)
 const REDIS_DB_INDEX = parseInt(new URL(REDIS_URL).pathname.replace('/', '') || '0', 10);
 
-const DISCONNECT_GRACE_SECS = 30; // only for active/prep games
+const DISCONNECT_GRACE_SECS = 30;
 const PRESENCE_KEY_PREFIX   = 'presence:disconnected:';
 
-// ─── Redis clients ─────────────────────────────────────────────────────────
-// Five clients, each with a dedicated role:
-//   pubClient         — Socket.IO adapter publisher (exclusive to adapter)
-//   subClient         — Socket.IO adapter subscriber (exclusive to adapter)
-//   eventsSubClient   — subscribes to draftchess:game-events channel
-//   presenceSubClient — subscribes to Redis keyspace expiry notifications
-//   cmdClient         — general commands: SET, DEL, PUBLISH (#16)
 function makeRedisClient() {
   const client = createClient({ url: REDIS_URL });
   client.on('error',        (err) => console.error('[Redis] error:', err));
@@ -76,7 +68,6 @@ app.prepare().then(async () => {
     handle(req, res, parsedUrl);
   });
 
-  // ─── Socket.IO ─────────────────────────────────────────────────────────────
   const allowedOrigin = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
   const ioOptions: Partial<ServerOptions> = {
@@ -108,7 +99,7 @@ app.prepare().then(async () => {
     }
   });
 
-  // ─── Presence helpers (game disconnect grace period) ───────────────────────
+  // ─── Presence helpers ───────────────────────────────────────────────────────
   function presenceKey(userId: number, gameId: number) {
     return `${PRESENCE_KEY_PREFIX}${userId}:${gameId}`;
   }
@@ -183,8 +174,8 @@ app.prepare().then(async () => {
           });
 
           if (snapshot) {
-            const isWhite   = snapshot.whitePlayerId === userId;
-            const rawFen    = snapshot.fen ?? '';
+            const isWhite = snapshot.whitePlayerId === userId;
+            const rawFen  = snapshot.fen ?? '';
 
             let maskedFen = rawFen;
             if (snapshot.status === 'prep') {
@@ -198,8 +189,8 @@ app.prepare().then(async () => {
 
             let timeRemainingOnMove = MOVE_TIME_LIMIT;
             if (snapshot.status === 'active' && snapshot.lastMoveAt) {
-              const turn    = rawFen.split(' ')[1];
-              const myTurn  = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
+              const turn   = rawFen.split(' ')[1];
+              const myTurn = (turn === 'w' && isWhite) || (turn === 'b' && !isWhite);
               const elapsed = Date.now() - new Date(snapshot.lastMoveAt).getTime();
               if (myTurn) timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
             }
@@ -239,8 +230,6 @@ app.prepare().then(async () => {
       console.log(`[Socket.IO] disconnected: ${socket.id} (user: ${userId}, reason: ${reason})`);
 
       try {
-        // Single DB read to find out what state this user was in.
-        // We check both queue and active/prep game in one query.
         const user = await prisma.user.findUnique({
           where:  { id: userId },
           select: { queueStatus: true },
@@ -248,9 +237,6 @@ app.prepare().then(async () => {
 
         if (!user) return;
 
-        // ── Queued: remove instantly, no grace period ────────────────────────
-        // The socket is the heartbeat for queue membership. If it drops,
-        // the user is out. There is no game state to protect.
         if (user.queueStatus === 'queued') {
           await prisma.user.update({
             where: { id: userId },
@@ -261,18 +247,13 @@ app.prepare().then(async () => {
             },
           });
           console.log(`[Queue] user ${userId} removed from queue on disconnect`);
-          return; // not in a game, nothing else to do
+          return;
         }
 
-        // ── In a game: start the 30s grace period ────────────────────────────
-        // Only query for the active game if queueStatus indicates they're in one.
-        // This skips the findFirst entirely for users on the lobby/drafts pages. (#21)
         if (user.queueStatus !== 'in_game') return;
 
         const knownGameId = socket.data.gameId as number | undefined;
         if (!knownGameId) {
-          // Fallback: socket.data.gameId not set (server restart mid-session)
-          // — query DB as source of truth
           const game = await prisma.game.findFirst({
             where: {
               status: { in: ['active', 'prep'] },
@@ -291,7 +272,6 @@ app.prepare().then(async () => {
           return;
         }
 
-        // Fast path: we know the gameId from socket data
         const game = await prisma.game.findUnique({
           where:  { id: knownGameId },
           select: { id: true, status: true, player1Id: true, player2Id: true },
@@ -332,11 +312,66 @@ app.prepare().then(async () => {
   (global as any).redisPub        = cmdClient;
 
   // ─── Game events subscriber ────────────────────────────────────────────────
-  await eventsSubClient.subscribe(GAME_EVENTS_CHANNEL, (raw) => {
+  // CHANGE: game-update events that carry a FEN during prep phase are handled
+  // specially. Instead of broadcasting the raw FEN to the whole game room,
+  // we fetch the game's current status and draft FENs, then emit a per-player
+  // masked version to each player's individual room.
+  //
+  // For all other events (active game moves, status transitions, etc.) we
+  // broadcast to the whole room as before — there is nothing to hide after
+  // prep ends.
+  await eventsSubClient.subscribe(GAME_EVENTS_CHANNEL, async (raw) => {
     try {
       const msg = JSON.parse(raw);
+
       if (msg.type === 'game') {
-        io.to(`game-${msg.gameId}`).emit(msg.event, msg.payload);
+        const { gameId, event, payload } = msg;
+
+        // Only game-update events with a FEN during prep need per-player masking.
+        // Everything else (status changes, ELO, timebanks) broadcasts normally.
+        if (
+          event === 'game-update' &&
+          payload.fen &&
+          !payload.status // if status is present it means game ended or transitioned — no masking needed
+        ) {
+          // Check whether this game is still in prep so we don't do an
+          // unnecessary DB query for every move during active play.
+          // We use a lightweight select — just status and draft FENs.
+          const game = await prisma.game.findUnique({
+            where:  { id: gameId },
+            select: {
+              status:       true,
+              player1Id:    true,
+              player2Id:    true,
+              whitePlayerId: true,
+              draft1: { select: { fen: true } },
+              draft2: { select: { fen: true } },
+            },
+          });
+
+          if (game?.status === 'prep' && game.draft1?.fen && game.draft2?.fen) {
+            // Per-player masked emit — opponent cannot see each other's pieces
+            const originalFen = buildCombinedDraftFen(game.draft1.fen, game.draft2.fen);
+
+            const p1IsWhite   = game.whitePlayerId === game.player1Id;
+            const p1MaskedFen = maskOpponentAuxPlacements(payload.fen, originalFen, p1IsWhite);
+            const p2MaskedFen = maskOpponentAuxPlacements(payload.fen, originalFen, !p1IsWhite);
+
+            io.to(`game-${gameId}-user-${game.player1Id}`).emit(event, {
+              ...payload,
+              fen: p1MaskedFen,
+            });
+            io.to(`game-${gameId}-user-${game.player2Id}`).emit(event, {
+              ...payload,
+              fen: p2MaskedFen,
+            });
+            return; // handled — do not fall through to broadcast
+          }
+        }
+
+        // Default: broadcast to whole game room (active moves, transitions, etc.)
+        io.to(`game-${gameId}`).emit(event, payload);
+
       } else if (msg.type === 'game-user') {
         io.to(`game-${msg.gameId}-user-${msg.userId}`).emit(msg.event, msg.payload);
       } else if (msg.type === 'queue-user') {
@@ -345,7 +380,7 @@ app.prepare().then(async () => {
         console.warn('[Events] unknown message type:', msg.type);
       }
     } catch (err) {
-      console.error('[Events] failed to parse message:', raw, err);
+      console.error('[Events] failed to parse or handle message:', raw, err);
     }
   });
   console.log(`[Events] subscribed to ${GAME_EVENTS_CHANNEL}`);

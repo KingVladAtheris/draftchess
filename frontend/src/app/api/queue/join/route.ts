@@ -1,17 +1,15 @@
-// app/api/queue/join/route.ts
-//
-// FIX: Guard against a user joining the queue while already in an active or
-// prep game. Without this, a direct API call (bypassing the UI redirect)
-// could set queueStatus='queued' while in_game, causing the matchmaker to
-// pair them into a second concurrent game.
-
+// src/app/api/queue/join/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { triggerMatchmaking } from "@/app/lib/queue-join";
 import { consume, queueLimiter } from "@/app/lib/rate-limit";
+import { checkCsrf } from "@/app/lib/csrf";
 
 export async function POST(req: NextRequest) {
+  const csrfError = checkCsrf(req);
+  if (csrfError) return csrfError;
+
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -27,13 +25,11 @@ export async function POST(req: NextRequest) {
   }
 
   const { draftId } = body;
-
   if (!draftId || typeof draftId !== "number") {
     return NextResponse.json({ error: "draftId required" }, { status: 400 });
   }
 
   try {
-    // ── Guard: already in an active game ──────────────────────────────────
     const existingGame = await prisma.game.findFirst({
       where: {
         status: { in: ["active", "prep"] },
@@ -49,7 +45,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── Guard: draft ownership ─────────────────────────────────────────────
     const draft = await prisma.draft.findFirst({
       where: { id: draftId, userId },
     });
@@ -57,6 +52,9 @@ export async function POST(req: NextRequest) {
     if (!draft) {
       return NextResponse.json({ error: "Draft not found or not owned" }, { status: 403 });
     }
+
+    const limited = await consume(queueLimiter, req, userId.toString());
+    if (limited) return limited;
 
     await prisma.user.update({
       where: { id: userId },
@@ -68,7 +66,6 @@ export async function POST(req: NextRequest) {
     });
 
     await triggerMatchmaking();
-
     return NextResponse.json({ success: true });
   } catch (err) {
     console.error(err);

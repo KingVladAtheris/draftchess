@@ -1,10 +1,12 @@
 // src/app/play/select/SelectClient.tsx
-// Z-pattern: draft list left, queue panel sticky right.
-// One decision (which draft), one action (queue). Nothing else.
+// CHANGE: raw fetch() replaced with apiFetch() on all POST routes
+//         so the CSRF header is sent automatically.
+//         GET to /api/queue/status keeps plain fetch (read-only, no CSRF needed).
 "use client";
 
 import { useState, useEffect, useRef } from "react";
 import { getSocket } from "@/app/lib/socket";
+import { apiFetch } from "@/app/lib/api-fetch";
 
 type Draft = { id: number; name: string | null; points: number; updatedAt: Date; };
 
@@ -121,18 +123,28 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
 
   useEffect(() => {
     let mounted = true;
-    fetch("/api/queue/status").then(r => r.ok ? r.json() : null).then(data => {
-      if (!mounted || !data) return;
-      if (data.matched && data.gameId) { window.location.href = `/play/game/${data.gameId}`; return; }
-      if (data.status === "queued") { setIsQueuing(true); attachSocket(); }
-    }).catch(() => {});
+    // GET — no CSRF needed, plain fetch is fine
+    fetch("/api/queue/status")
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!mounted || !data) return;
+        if (data.matched && data.gameId) { window.location.href = `/play/game/${data.gameId}`; return; }
+        if (data.status === "queued") { setIsQueuing(true); attachSocket(); }
+      })
+      .catch(() => {});
     return () => { mounted = false; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     return () => {
       if (isQueuingRef.current && !didLeaveRef.current) {
-        fetch("/api/queue/leave", { method: "POST", keepalive: true }).catch(() => {});
+        // keepalive POST on unmount — apiFetch doesn't support keepalive,
+        // so we call fetch directly but manually add the CSRF header.
+        fetch("/api/queue/leave", {
+          method:    "POST",
+          keepalive: true,
+          headers:   { "x-draftchess-csrf": "1" },
+        }).catch(() => {});
         getSocket().then(s => s.emit("leave-queue")).catch(() => {});
       }
     };
@@ -155,7 +167,10 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
     if (!selectedId || isQueuing) return;
     setError(null);
     try {
-      const res = await fetch("/api/queue/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ draftId: selectedId }) });
+      const res = await apiFetch("/api/queue/join", {
+        method: "POST",
+        body:   JSON.stringify({ draftId: selectedId }),
+      });
       if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to join queue"); }
       didLeaveRef.current = false; setIsQueuing(true); attachSocket();
     } catch (e: any) { setError(e.message); }
@@ -163,7 +178,7 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
 
   const handleLeave = async () => {
     didLeaveRef.current = true; setIsQueuing(false);
-    await fetch("/api/queue/leave", { method: "POST" }).catch(() => {});
+    await apiFetch("/api/queue/leave", { method: "POST" }).catch(() => {});
     getSocket().then(s => { s.emit("leave-queue"); s.off("matched"); s.off("queue-error"); }).catch(() => {});
   };
 

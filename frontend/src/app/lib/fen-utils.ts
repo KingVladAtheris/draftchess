@@ -1,6 +1,6 @@
 // src/app/lib/fen-utils.ts
 // Shared FEN manipulation utilities for Draft Chess
-
+export const MIN_ELO = 100;
 export function expandFenRow(row: string): string {
   let result = "";
   for (const char of row) {
@@ -178,12 +178,18 @@ export function calculateEloChange(
   winnerGames: number,
   isDraw: boolean = false
 ): { winnerChange: number; loserChange: number } {
-  const kFactor = winnerGames < 30 ? 32 : winnerGames < 100 ? 24 : 16;
-  const expectedWinner = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
-  const expectedLoser = 1 - expectedWinner;
+  const kFactor      = winnerGames < 30 ? 32 : winnerGames < 100 ? 24 : 16;
+  const expectedWin  = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
   const actualWinner = isDraw ? 0.5 : 1;
-  const actualLoser = isDraw ? 0.5 : 0;
-  const winnerChange = Math.round(kFactor * (actualWinner - expectedWinner));
-  const loserChange = Math.round(kFactor * (actualLoser - expectedLoser));
+  const actualLoser  = isDraw ? 0.5 : 0;
+
+  const rawWinnerChange = Math.round(kFactor * (actualWinner - expectedWin));
+  const rawLoserChange  = Math.round(kFactor * (actualLoser  - (1 - expectedWin)));
+
+  // Apply floor: loser cannot drop below MIN_ELO
+  const loserChange  = Math.max(rawLoserChange,  MIN_ELO - loserElo);
+  // Winner always gains (floor only matters for the loser)
+  const winnerChange = rawWinnerChange;
+
   return { winnerChange, loserChange };
 }

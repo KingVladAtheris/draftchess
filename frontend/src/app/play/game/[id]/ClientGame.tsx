@@ -6,12 +6,17 @@
 //   - Urgency salience: timer shifts amber→orange→red as time depletes
 //   - Zeigarnik tension: move bar fills/drains to maintain engagement
 //   - Social presence: opponent status always visible, never hidden
+// CHANGES (Step 8):
+//   - All alert() calls replaced with useToast()
+//   - All fetch() calls replaced with apiFetch() (adds CSRF header automatically)
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Chessboard } from "react-chessboard";
 import { Chess, type Square } from "chess.js";
 import { getSocket } from "@/app/lib/socket";
+import { useToast } from "@/components/ToastProvider";
+import { apiFetch } from "@/app/lib/api-fetch";
 
 class DraftChess extends Chess {
   constructor(fen?: string) { super(fen ?? "start"); }
@@ -78,6 +83,8 @@ export default function ClientGame({
   initialPrepStartedAt, initialReadyPlayer1, initialReadyPlayer2,
   initialAuxPointsPlayer1, initialAuxPointsPlayer2, player1Id, player2Id,
 }: ClientGameProps) {
+
+  const toast = useToast();
 
   const [fen, setFen]                           = useState(initialFen);
   const [status, setStatus]                     = useState<GameStatus>(initialStatus as GameStatus);
@@ -221,7 +228,7 @@ export default function ClientGame({
     let mounted = true;
     const init = async () => {
       try {
-        const res = await fetch(`/api/game/${gameId}/status`);
+        const res = await apiFetch(`/api/game/${gameId}/status`, { method: "GET" });
         if (!res.ok) throw new Error("Failed to load game state");
         const data = await res.json();
         if (mounted) {
@@ -240,10 +247,10 @@ export default function ClientGame({
         const socket = await getSocket();
         socket.emit("join-game", gameId);
         socket.on("game-update",           (p: any)   => { if (mounted) handleGameUpdate(p); });
-        socket.on("opponent-disconnected", ()         => { if (mounted) setOpponentConnected(false); });
-        socket.on("opponent-connected",    ()         => { if (mounted) setOpponentConnected(true); });
-        socket.on("connect_error",         (e: Error) => { if (mounted) setSocketError("Connection lost — moves may be delayed."); });
-        socket.on("reconnect",             ()         => { if (mounted) { setSocketError(null); socket.emit("join-game", gameId); } });
+        socket.on("opponent-disconnected", () => { if (mounted) { setOpponentConnected(false); toast.warn("Opponent disconnected"); } });
+        socket.on("opponent-connected",    () => { if (mounted) { setOpponentConnected(true);  toast.info("Opponent reconnected"); } });
+        socket.on("connect_error",  (_e: Error) => { if (mounted) { setSocketError("Connection lost — reconnecting…"); toast.warn("Connection lost — moves may be delayed"); } });
+        socket.on("reconnect",      ()          => { if (mounted) { setSocketError(null); toast.info("Reconnected"); socket.emit("join-game", gameId); } });
         socket.on("game-snapshot", (data: any) => {
           if (!mounted) return;
           handleGameUpdate(data);
@@ -375,32 +382,37 @@ export default function ClientGame({
     if (!sel || ownReady || sel.value > auxPoints) return;
     setActivePiece(null); setLegalSquares([]); setIllegalSquares([]);
     try {
-      const res = await fetch(`/api/game/${gameId}/place`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ piece: fenLetter, square }) });
-      if (!res.ok) { const err = await res.json(); alert(err.error ?? "Failed to place piece"); }
-    } catch { alert("Failed to place piece — please try again"); }
+      const res = await apiFetch(`/api/game/${gameId}/place`, { method: "POST", body: JSON.stringify({ piece: fenLetter, square }) });
+      if (!res.ok) { const err = await res.json(); toast.error(err.error ?? "Failed to place piece"); }
+    } catch { toast.error("Failed to place piece — please try again"); }
   };
 
   const handleReady = async () => {
     if (ownReady) return;
     try {
-      const res = await fetch(`/api/game/${gameId}/ready`, { method: "POST" });
-      if (!res.ok) { const err = await res.json(); alert(err.error ?? "Failed to mark ready"); }
+      const res = await apiFetch(`/api/game/${gameId}/ready`, { method: "POST" });
+      if (!res.ok) { const err = await res.json(); toast.error(err.error ?? "Failed to mark ready"); }
     } catch (err) { console.error("Ready error:", err); }
   };
 
   const submitMove = useCallback((from: Square, to: Square, promotion: string) => {
     isSubmittingMove.current = true;
-    fetch(`/api/game/${gameId}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from, to, promotion }) })
+    apiFetch(`/api/game/${gameId}/move`, { method: "POST", body: JSON.stringify({ from, to, promotion }) })
       .then(async res => {
         if (!res.ok) {
-          const err = await res.json(); console.error("Move rejected:", err.error);
-          const sr = await fetch(`/api/game/${gameId}/status`);
+          const err = await res.json();
+          console.error("Move rejected:", err.error);
+          toast.warn(err.error ?? "Move rejected — board refreshed");
+          const sr = await apiFetch(`/api/game/${gameId}/status`, { method: "GET" });
           if (sr.ok) handleGameUpdate(await sr.json());
         }
       })
-      .catch(err => console.error("Move error:", err))
+      .catch(err => {
+        console.error("Move error:", err);
+        toast.error("Connection error — move may not have been recorded");
+      })
       .finally(() => { isSubmittingMove.current = false; });
-  }, [gameId, handleGameUpdate]);
+  }, [gameId, handleGameUpdate, toast]);
 
   const handlePromotionChoice = (p: string) => {
     if (!pendingPromotion) return;
@@ -433,9 +445,9 @@ export default function ClientGame({
   const handleResign = async () => {
     if (!confirm("Resign this game?")) return;
     try {
-      const res = await fetch(`/api/game/${gameId}/resign`, { method: "POST" });
-      if (!res.ok) { const err = await res.json(); alert(err.error ?? "Failed to resign"); }
-    } catch (err) { console.error("Resign error:", err); }
+      const res = await apiFetch(`/api/game/${gameId}/resign`, { method: "POST" });
+      if (!res.ok) { const err = await res.json(); toast.error(err.error ?? "Failed to resign"); }
+    } catch (err) { console.error("Resign error:", err); toast.error("Connection error — could not resign"); }
   };
 
   // ─── Derived display ───────────────────────────────────────────────────────

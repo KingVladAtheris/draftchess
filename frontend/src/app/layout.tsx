@@ -1,10 +1,12 @@
 // src/app/layout.tsx
-
+// CHANGE: Wrapped with ToastProvider so any client component in the tree
+// can call useToast() without prop-drilling.
 import type { Metadata } from "next";
 import { Outfit, DM_Sans } from "next/font/google";
 import "./globals.css";
 import Nav from "@/components/Nav";
 import SessionProvider from "@/components/SessionProvider";
+import { ToastProvider } from "@/components/ToastProvider";
 import { auth } from "@/auth";
 
 const outfit = Outfit({
@@ -28,17 +30,16 @@ export const metadata: Metadata = {
 };
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  // Fetch session on the server once and pass it to SessionProvider.
-  // Client components (Nav, etc.) then read from the context via useSession()
-  // which updates reactively — no server re-render needed on sign in/out.
   const session = await auth();
 
   return (
     <html lang="en" className={`${outfit.variable} ${dmSans.variable}`}>
       <body className="min-h-screen bg-[#0f1117] text-white antialiased">
         <SessionProvider session={session}>
-          <Nav />
-          <main>{children}</main>
+          <ToastProvider>
+            <Nav />
+            <main>{children}</main>
+          </ToastProvider>
         </SessionProvider>
       </body>
     </html>

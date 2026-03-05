@@ -1,12 +1,12 @@
 // src/app/api/signup/route.ts
-
+// CHANGE: uses consumeAuth (fail-closed) instead of consume.
 import { prisma } from "@/app/lib/prisma.server";
 import bcrypt from "bcrypt";
 import { NextRequest } from "next/server";
-import { consume, signupLimiter } from "@/app/lib/rate-limit";
+import { consumeAuth, signupLimiter } from "@/app/lib/rate-limit";
 
 export async function POST(request: NextRequest) {
-  const limited = await consume(signupLimiter, request); // keyed by IP — user not yet known
+  const limited = await consumeAuth(signupLimiter, request); // keyed by IP
   if (limited) return limited;
 
   try {

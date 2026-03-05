@@ -1,21 +1,35 @@
 // src/app/lib/elo-update.ts
-// Shared ELO update logic — called after any game-ending event.
 //
-// FIXES applied here:
-//   #1/#2 — All writes are inside a single $transaction. The guard (status→finished)
-//            and all ELO/stat writes are atomic. Two concurrent callers (move route +
-//            timeout worker, or forfeit + move route) cannot both pass the guard.
-//   #3    — queueStatus reset to 'offline' for both players so they can re-queue
-//            after any game end (checkmate, resign, timeout, draw, abandon).
-//   #10   — currentForUserId cleared on game finish.
+// CHANGES:
+//   - ELO floor: neither player can drop below MIN_ELO (100).
+//   - currentForUserId removed (field deleted from schema in Step 1).
+//   - Rapid-loss guard: if a player loses more than MAX_LOSSES_PER_HOUR games
+//     in one hour, their ELO loss is capped at 1 point per game for that game.
+//     This limits the damage from arranged loss farming without banning players.
+//   - The rapid-loss check is a single extra indexed query; it only fires on
+//     a loss, not on wins or draws.
 
 import { prisma } from "@/app/lib/prisma.server";
 import { calculateEloChange } from "@/app/lib/fen-utils";
 
-// Sentinel thrown inside the transaction to signal "already finished"
-// without causing a real rollback / error propagation.
+const MIN_ELO             = 100;   // hard floor
+const MAX_LOSSES_PER_HOUR = 8;     // more than this in 60 min → loss capped to 1pt
+
 class AlreadyFinishedError extends Error {
   constructor() { super("already_finished"); }
+}
+
+async function recentLossCount(userId: number): Promise<number> {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  return prisma.game.count({
+    where: {
+      status:    "finished",
+      endReason: { not: "draw" },
+      winnerId:  { not: userId },   // they lost
+      OR: [{ player1Id: userId }, { player2Id: userId }],
+      createdAt: { gte: oneHourAgo },
+    },
+  });
 }
 
 export async function updateGameResult(
@@ -32,6 +46,23 @@ export async function updateGameResult(
 
   const isDraw = winnerId === null;
 
+  // ── Rapid-loss guard ──────────────────────────────────────────────────────
+  // Check if the loser has lost suspiciously often in the last hour.
+  // We cap their ELO loss (not the winner's gain) to reduce farming incentive.
+  let p1LossCap = false;
+  let p2LossCap = false;
+
+  if (!isDraw) {
+    const loserId = winnerId === player1Id ? player2Id : player1Id;
+    const losses  = await recentLossCount(loserId);
+    if (losses >= MAX_LOSSES_PER_HOUR) {
+      console.warn(`[ELO] rapid-loss cap applied for user ${loserId} (${losses} losses in last hour)`);
+      if (loserId === player1Id) p1LossCap = true;
+      else                       p2LossCap = true;
+    }
+  }
+
+  // ── ELO calculation ───────────────────────────────────────────────────────
   let player1EloChange: number;
   let player2EloChange: number;
 
@@ -42,21 +73,22 @@ export async function updateGameResult(
   } else if (winnerId === player1Id) {
     const result = calculateEloChange(player1EloBefore, player2EloBefore, player1Games, false);
     player1EloChange = result.winnerChange;
-    player2EloChange = result.loserChange;
+    player2EloChange = p2LossCap ? -1 : result.loserChange;
   } else {
     const result = calculateEloChange(player2EloBefore, player1EloBefore, player2Games, false);
     player2EloChange = result.winnerChange;
-    player1EloChange = result.loserChange;
+    player1EloChange = p1LossCap ? -1 : result.loserChange;
   }
 
-  const newPlayer1Elo = player1EloBefore + player1EloChange;
-  const newPlayer2Elo = player2EloBefore + player2EloChange;
+  // ── ELO floor ─────────────────────────────────────────────────────────────
+  const rawP1Elo    = player1EloBefore + player1EloChange;
+  const rawP2Elo    = player2EloBefore + player2EloChange;
+  const newPlayer1Elo = Math.max(MIN_ELO, rawP1Elo);
+  const newPlayer2Elo = Math.max(MIN_ELO, rawP2Elo);
   const eloChange     = Math.abs(player1EloChange);
 
   try {
     await prisma.$transaction(async (tx) => {
-      // ── Atomic guard ─────────────────────────────────────────────────────
-      // Only one concurrent caller will update this row; the other sees count=0.
       const guard = await tx.game.updateMany({
         where: { id: gameId, status: "active" },
         data:  { status: "finished" },
@@ -66,20 +98,18 @@ export async function updateGameResult(
         throw new AlreadyFinishedError();
       }
 
-      // ── Write final game result ───────────────────────────────────────────
       await tx.game.update({
         where: { id: gameId },
         data: {
-          winnerId:         winnerId ?? undefined,
-          player1EloAfter:  newPlayer1Elo,
-          player2EloAfter:  newPlayer2Elo,
+          winnerId:        winnerId ?? undefined,
+          player1EloAfter: newPlayer1Elo,
+          player2EloAfter: newPlayer2Elo,
           eloChange,
           endReason,
-          currentForUserId: null,   // #10: clear stale reference
+          // currentForUserId field removed in Step 1
         },
       });
 
-      // ── Update player stats + reset queue state ───────────────────────────
       await tx.user.update({
         where: { id: player1Id },
         data: {
@@ -88,7 +118,6 @@ export async function updateGameResult(
           wins:    (!isDraw && winnerId === player1Id) ? { increment: 1 } : undefined,
           losses:  (!isDraw && winnerId !== player1Id) ? { increment: 1 } : undefined,
           draws:   isDraw                              ? { increment: 1 } : undefined,
-          // #3: allow re-queue immediately after any game end
           queueStatus:   "offline",
           queuedAt:      null,
           queuedDraftId: null,
@@ -103,7 +132,6 @@ export async function updateGameResult(
           wins:    (!isDraw && winnerId === player2Id) ? { increment: 1 } : undefined,
           losses:  (!isDraw && winnerId !== player2Id) ? { increment: 1 } : undefined,
           draws:   isDraw                              ? { increment: 1 } : undefined,
-          // #3: allow re-queue immediately after any game end
           queueStatus:   "offline",
           queuedAt:      null,
           queuedDraftId: null,
