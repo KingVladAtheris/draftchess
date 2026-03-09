@@ -18,6 +18,8 @@ import { getToken } from 'next-auth/jwt';
 import { prisma } from '@/app/lib/prisma.server';
 import { buildCombinedDraftFen, maskOpponentAuxPlacements } from '@/app/lib/fen-utils';
 import { forfeitGame } from '@/app/lib/forfeit';
+import '@/app/lib/env';
+import { logger } from '@/app/lib/logger'; // validate env vars at boot — exits immediately if any are missing
 
 const dev      = process.env.NODE_ENV !== 'production';
 const hostname = process.env.HOSTNAME || 'localhost';
@@ -25,7 +27,7 @@ const port     = parseInt(process.env.PORT || '3000', 10);
 
 const REDIS_URL = process.env.REDIS_URL;
 if (!REDIS_URL) {
-  console.error('[server] REDIS_URL is not set');
+  logger.fatal('REDIS_URL is not set');
   process.exit(1);
 }
 
@@ -36,8 +38,8 @@ const PRESENCE_KEY_PREFIX   = 'presence:disconnected:';
 
 function makeRedisClient() {
   const client = createClient({ url: REDIS_URL });
-  client.on('error',        (err) => console.error('[Redis] error:', err));
-  client.on('reconnecting', ()    => console.warn('[Redis] reconnecting...'));
+  client.on('error',        (err) => logger.error({ err }, '[Redis] error'));
+  client.on('reconnecting', ()    => logger.warn('[Redis] reconnecting'));
   return client;
 }
 
@@ -61,14 +63,14 @@ app.prepare().then(async () => {
     presenceSubClient.connect(),
     cmdClient.connect(),
   ]);
-  console.log('[Redis] all clients connected');
+  logger.info('[Redis] all clients connected');
 
   const httpServer = createServer(async (req, res) => {
     const parsedUrl = parse(req.url!, true);
     handle(req, res, parsedUrl);
   });
 
-  const allowedOrigin = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+  const allowedOrigin = process.env.APP_URL || 'http://localhost:3000';
 
   const ioOptions: Partial<ServerOptions> = {
     path:             '/api/socket.io',
@@ -84,7 +86,7 @@ app.prepare().then(async () => {
 
   const io = new SocketServer(httpServer, ioOptions);
   io.adapter(createAdapter(pubClient, subClient));
-  console.log('[Socket.IO] Redis adapter attached');
+  logger.info('[Socket.IO] Redis adapter attached');
 
   // ─── Auth middleware ────────────────────────────────────────────────────────
   io.use(async (socket, next) => {
@@ -106,18 +108,18 @@ app.prepare().then(async () => {
 
   async function setDisconnectedPresence(userId: number, gameId: number) {
     await cmdClient.set(presenceKey(userId, gameId), '1', { EX: DISCONNECT_GRACE_SECS });
-    console.log(`[Presence] user ${userId} disconnected from game ${gameId}, grace ${DISCONNECT_GRACE_SECS}s`);
+    logger.info({ userId, gameId, graceSecs: DISCONNECT_GRACE_SECS }, '[Presence] disconnect grace started');
   }
 
   async function clearDisconnectedPresence(userId: number, gameId: number) {
     await cmdClient.del(presenceKey(userId, gameId));
-    console.log(`[Presence] user ${userId} reconnected to game ${gameId}, grace period cancelled`);
+    logger.info({ userId, gameId }, '[Presence] reconnected, grace cancelled');
   }
 
   // ─── Connection handler ─────────────────────────────────────────────────────
   io.on('connection', (socket) => {
     const userId = socket.data.userId as number;
-    console.log(`[Socket.IO] connected: ${socket.id} (user: ${userId})`);
+    logger.debug({ socketId: socket.id, userId }, '[Socket.IO] connected');
 
     socket.join(`queue-user-${userId}`);
     socket.on('join-queue',  () => socket.join('queue'));
@@ -134,12 +136,12 @@ app.prepare().then(async () => {
         });
 
         if (!game) {
-          console.warn(`[Socket.IO] join-game: game ${gameId} not found`);
+          logger.warn({ gameId }, '[Socket.IO] join-game: game not found');
           return;
         }
 
         if (game.player1Id !== userId && game.player2Id !== userId) {
-          console.warn(`[Socket.IO] join-game: user ${userId} is not participant in game ${gameId}`);
+          logger.warn({ userId, gameId }, '[Socket.IO] join-game: user not participant');
           return;
         }
 
@@ -183,7 +185,7 @@ app.prepare().then(async () => {
                 const originalFen = buildCombinedDraftFen(snapshot.draft1.fen, snapshot.draft2.fen);
                 maskedFen = maskOpponentAuxPlacements(rawFen, originalFen, isWhite);
               } else {
-                console.warn(`[Socket.IO] snapshot: draft missing for game ${gameId} during prep`);
+                logger.warn({ gameId }, '[Socket.IO] snapshot: draft missing during prep');
               }
             }
 
@@ -216,18 +218,18 @@ app.prepare().then(async () => {
             });
           }
         } catch (snapErr) {
-          console.error(`[Socket.IO] snapshot error for game ${gameId}:`, snapErr);
+          logger.error({ err: snapErr, gameId }, '[Socket.IO] snapshot error');
         }
 
-        console.log(`[Socket.IO] user ${userId} joined game-${gameId}`);
+        logger.info({ userId, gameId }, '[Socket.IO] user joined game');
       } catch (err) {
-        console.error(`[Socket.IO] join-game error for user ${userId}, game ${gameId}:`, err);
+        logger.error({ err, userId, gameId }, '[Socket.IO] join-game error');
       }
     });
 
     // ── disconnect ─────────────────────────────────────────────────────────────
     socket.on('disconnect', async (reason) => {
-      console.log(`[Socket.IO] disconnected: ${socket.id} (user: ${userId}, reason: ${reason})`);
+      logger.debug({ socketId: socket.id, userId, reason }, '[Socket.IO] disconnected');
 
       try {
         const user = await prisma.user.findUnique({
@@ -246,7 +248,7 @@ app.prepare().then(async () => {
               queuedDraftId: null,
             },
           });
-          console.log(`[Queue] user ${userId} removed from queue on disconnect`);
+          logger.info({ userId }, '[Queue] user removed from queue on disconnect');
           return;
         }
 
@@ -287,7 +289,7 @@ app.prepare().then(async () => {
         });
 
       } catch (err) {
-        console.error(`[Socket.IO] disconnect handler error for user ${userId}:`, err);
+        logger.error({ err, userId }, '[Socket.IO] disconnect handler error');
       }
     });
   });
@@ -377,13 +379,13 @@ app.prepare().then(async () => {
       } else if (msg.type === 'queue-user') {
         io.to(`queue-user-${msg.userId}`).emit(msg.event, msg.payload);
       } else {
-        console.warn('[Events] unknown message type:', msg.type);
+        logger.warn({ type: msg.type }, '[Events] unknown message type');
       }
     } catch (err) {
-      console.error('[Events] failed to parse or handle message:', raw, err);
+      logger.error({ err, raw }, '[Events] failed to parse or handle message');
     }
   });
-  console.log(`[Events] subscribed to ${GAME_EVENTS_CHANNEL}`);
+  logger.info({ channel: GAME_EVENTS_CHANNEL }, '[Events] subscribed');
 
   // ─── Presence expiry subscriber ────────────────────────────────────────────
   const keyspaceChannel = `__keyevent@${REDIS_DB_INDEX}__:expired`;
@@ -395,23 +397,23 @@ app.prepare().then(async () => {
     const gameId = parseInt(parts[1]);
 
     if (isNaN(userId) || isNaN(gameId)) {
-      console.warn('[Presence] could not parse expired key:', expiredKey);
+      logger.warn({ expiredKey }, '[Presence] could not parse expired key');
       return;
     }
 
-    console.log(`[Presence] grace period expired for user ${userId} in game ${gameId} — forfeiting`);
+    logger.info({ userId, gameId }, '[Presence] grace period expired, forfeiting');
     await forfeitGame(gameId, userId, emitToGame);
   });
-  console.log(`[Presence] subscribed to ${keyspaceChannel}`);
+  logger.info({ channel: keyspaceChannel }, '[Presence] subscribed to keyspace');
 
   // ─── Start ─────────────────────────────────────────────────────────────────
   httpServer.listen(port, () => {
-    console.log(`[Server] ready on http://${hostname}:${port}`);
+    logger.info({ hostname, port }, '[Server] ready');
   });
 
   // ─── Graceful shutdown ─────────────────────────────────────────────────────
   async function shutdown(signal: string) {
-    console.log(`[Server] ${signal} — shutting down`);
+    logger.info({ signal }, '[Server] shutting down');
     httpServer.close(async () => {
       await io.close();
       await pubClient.quit();
@@ -419,7 +421,7 @@ app.prepare().then(async () => {
       await eventsSubClient.quit();
       await presenceSubClient.quit();
       await cmdClient.quit();
-      console.log('[Server] clean exit');
+      logger.info('[Server] clean exit');
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000);

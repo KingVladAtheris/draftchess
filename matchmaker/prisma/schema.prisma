@@ -101,6 +101,8 @@ model Game {
   @@index([draft2Id])
   @@index([winnerId])
   @@index([lastMoveAt])
+  // Compound index for the reconciliation query (WHERE status='active' AND lastMoveAt < cutoff)
+  @@index([status, lastMoveAt])
 }
 
 model Draft {

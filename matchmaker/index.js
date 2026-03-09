@@ -1,13 +1,12 @@
 // matchmaker/index.js
 // CHANGES vs previous version:
 //   - notifyMatch() now publishes to Redis channel instead of HTTP POST.
-//     This removes the HTTP dependency on the Next.js server being up at the
-//     exact moment of match creation, and works correctly with multiple
-//     Next.js instances behind a load balancer.
 //   - finalizeGame(): currentForUserId removed (schema Step 1).
 //   - MIN_ELO floor applied in finalizeGame() to mirror fen-utils change.
 //   - Reconciliation worker added (Step 6) — see end of file.
-//   - Draft-in-use deletion guard references removed (handled in Step 7).
+//   - whitePlayerId bug fixed in timeout worker and scheduleTimeout.
+//   - Env validation added.
+//   - Structured logging via pino replacing all console.* calls.
 
 const { PrismaClient }   = require('@prisma/client');
 const { Pool }            = require('pg');
@@ -16,8 +15,11 @@ const { createClient: createRedisClient } = require('redis');
 const { Queue, Worker }   = require('bullmq');
 const http                = require('http');
 
-if (!process.env.DATABASE_URL) { console.error('DATABASE_URL not set'); process.exit(1); }
-if (!process.env.REDIS_URL)    { console.error('REDIS_URL not set');    process.exit(1); }
+require('./lib/env');
+const { logger } = require('./lib/logger');
+
+if (!process.env.DATABASE_URL) { logger.error('DATABASE_URL not set'); process.exit(1); }
+if (!process.env.REDIS_URL)    { logger.error('REDIS_URL not set');    process.exit(1); }
 
 const pool    = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -35,7 +37,7 @@ function parseRedisUrl(url) {
 const redisOpts = parseRedisUrl(process.env.REDIS_URL);
 
 const redisPublisher = createRedisClient({ url: process.env.REDIS_URL });
-redisPublisher.on('error', (err) => console.error('[Redis] pub error:', err));
+redisPublisher.on('error', (err) => logger.error('[Redis] pub error:', err));
 
 const GAME_EVENTS_CHANNEL  = 'draftchess:game-events';
 const MIN_ELO              = 100;
@@ -45,7 +47,7 @@ async function publishEvent(type, payload) {
   try {
     await redisPublisher.publish(GAME_EVENTS_CHANNEL, JSON.stringify(payload));
   } catch (err) {
-    console.error(`[Redis] publish failed:`, err.message);
+    logger.error(`[Redis] publish failed:`, err.message);
   }
 }
 
@@ -71,7 +73,7 @@ async function notifyMatch(gameId, userIds) {
       type: 'queue-user', userId, event: 'matched', payload: { gameId },
     });
   }
-  console.log(`[Match] notified users ${userIds.join(', ')} of game ${gameId} via Redis`);
+  logger.info(`[Match] notified users ${userIds.join(', ')} of game ${gameId} via Redis`);
 }
 
 // ─── ELO helpers ───────────────────────────────────────────────────────────
@@ -156,7 +158,7 @@ async function finalizeGame(gameId, winnerId, player1Id, player2Id,
       finalized = true;
     });
   } catch (err) {
-    console.error(`[finalizeGame] game ${gameId} transaction error:`, err.message);
+    logger.error(`[finalizeGame] game ${gameId} transaction error:`, err.message);
     throw err;
   }
 
@@ -190,7 +192,7 @@ function findBestMatch(target, candidates) {
     .sort((a, b) => a.diff - b.diff);
   const best = sorted[0];
   if (best.diff > limit) {
-    console.log(`[Match] no suitable opponent for ${target.username} (diff=${best.diff}, limit=${limit})`);
+    logger.info(`[Match] no suitable opponent for ${target.username} (diff=${best.diff}, limit=${limit})`);
     return null;
   }
   return best;
@@ -203,14 +205,18 @@ const prepQueue         = new Queue('prep-queue',         { connection: redisOpt
 const timeoutQueue      = new Queue('timeout-queue',      { connection: redisOpts, defaultJobOptions: defaultJobOpts });
 const reconcileQueue    = new Queue('reconcile-queue',    { connection: redisOpts, defaultJobOptions: defaultJobOpts });
 
-async function scheduleTimeout(gameId, player1Timebank, player2Timebank, lastMoveAt, fenTurn = 'w') {
-  const activeTimebank = fenTurn === 'w' ? player1Timebank : player2Timebank;
+// scheduleTimeout — delay = move limit + active player's timebank.
+// fenTurn: 'w' or 'b'. whiteIsP1: whether whitePlayerId === player1Id.
+// Both are needed to correctly identify which timebank is draining.
+async function scheduleTimeout(gameId, player1Timebank, player2Timebank, lastMoveAt, fenTurn = 'w', whiteIsP1 = true) {
+  const isP1Turn      = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1;
+  const activeTimebank = isP1Turn ? player1Timebank : player2Timebank;
   const delay          = 30000 + Math.max(0, activeTimebank);
   try {
     const existing = await timeoutQueue.getJob(`timeout-${gameId}`);
     if (existing) await existing.remove();
   } catch (err) {
-    console.warn(`[Queue] could not remove previous timeout job for game ${gameId}:`, err.message);
+    logger.warn(`[Queue] could not remove previous timeout job for game ${gameId}:`, err.message);
   }
   await timeoutQueue.add(
     'check-timeout',
@@ -233,7 +239,7 @@ const matchWorker = new Worker('match-queue', async (_job) => {
   const player2 = findBestMatch(player1, queuedPlayers.slice(1));
   if (!player2) return;
 
-  console.log(`[Match] pairing ${player1.username} (${player1.elo}) vs ${player2.username} (${player2.elo})`);
+  logger.info(`[Match] pairing ${player1.username} (${player1.elo}) vs ${player2.username} (${player2.elo})`);
 
   const [draft1, draft2] = await Promise.all([
     prisma.draft.findUnique({ where: { id: player1.queuedDraftId }, select: { fen: true } }),
@@ -241,7 +247,7 @@ const matchWorker = new Worker('match-queue', async (_job) => {
   ]);
 
   if (!draft1 || !draft2) {
-    console.error('[Match] draft not found, clearing players');
+    logger.error('[Match] draft not found, clearing players');
     await prisma.user.updateMany({
       where: { id: { in: [player1.id, player2.id] } },
       data:  { queueStatus: 'offline', queuedAt: null, queuedDraftId: null },
@@ -289,7 +295,7 @@ const matchWorker = new Worker('match-queue', async (_job) => {
     { delay: 62000, jobId: `prep-${game.id}` },
   );
 
-  console.log(`[Match] game ${game.id} created`);
+  logger.info(`[Match] game ${game.id} created`);
 }, { connection: redisOpts, concurrency: 1 });
 
 // ─── Prep worker ───────────────────────────────────────────────────────────
@@ -300,13 +306,14 @@ const prepWorker = new Worker('prep-queue', async (job) => {
     where:  { id: gameId },
     select: {
       id: true, status: true, fen: true, prepStartedAt: true,
+      player1Id: true, whitePlayerId: true,
       draft1: { select: { fen: true } },
       draft2: { select: { fen: true } },
     },
   });
 
   if (!g || g.status !== 'prep') {
-    console.log(`[Prep] game ${gameId} already started or not found, skipping`);
+    logger.info(`[Prep] game ${gameId} already started or not found, skipping`);
     return;
   }
 
@@ -315,7 +322,7 @@ const prepWorker = new Worker('prep-queue', async (job) => {
     : (g.draft1?.fen && g.draft2?.fen ? combineFens(g.draft1.fen, g.draft2.fen) : null);
 
   if (!activeFen) {
-    console.error(`[Prep] game ${gameId} has no valid FEN`);
+    logger.error(`[Prep] game ${gameId} has no valid FEN`);
     return;
   }
 
@@ -326,7 +333,7 @@ const prepWorker = new Worker('prep-queue', async (job) => {
   });
 
   if (guard.count === 0) {
-    console.log(`[Prep] game ${gameId} already started by ready route, skipping`);
+    logger.info(`[Prep] game ${gameId} already started by ready route, skipping`);
     return;
   }
 
@@ -336,8 +343,8 @@ const prepWorker = new Worker('prep-queue', async (job) => {
     readyPlayer1: true, readyPlayer2: true,
   });
 
-  await scheduleTimeout(gameId, 60000, 60000, now, 'w');
-  console.log(`[Prep] game ${gameId} auto-started`);
+  await scheduleTimeout(gameId, 60000, 60000, now, 'w', g.whitePlayerId === g.player1Id);
+  logger.info(`[Prep] game ${gameId} auto-started`);
 
 }, { connection: redisOpts, concurrency: 5 });
 
@@ -349,7 +356,7 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
     where:  { id: gameId },
     select: {
       id: true, status: true, fen: true,
-      player1Id: true, player2Id: true,
+      player1Id: true, player2Id: true, whitePlayerId: true,
       lastMoveAt: true, player1Timebank: true, player2Timebank: true,
       player1EloBefore: true, player2EloBefore: true,
       player1: { select: { gamesPlayed: true, username: true } },
@@ -358,28 +365,23 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
   });
 
   if (!game || game.status !== 'active') {
-    console.log(`[Timeout] game ${gameId} not active, skipping`);
+    logger.info(`[Timeout] game ${gameId} not active, skipping`);
     return;
   }
 
   if (game.lastMoveAt && new Date(game.lastMoveAt).toISOString() !== scheduledAt) {
-    console.log(`[Timeout] game ${gameId} stale job, skipping`);
+    logger.info(`[Timeout] game ${gameId} stale job, skipping`);
     return;
   }
 
-  const now      = Date.now();
-  const elapsed  = now - new Date(game.lastMoveAt).getTime();
-  const turn     = game.fen.split(' ')[1];
-  const isP1Turn = turn === 'w'
-    ? game.player1Id === game.whitePlayerId  // need whitePlayerId — see note below
-    : game.player2Id !== game.whitePlayerId;
+  const now     = Date.now();
+  const elapsed = now - new Date(game.lastMoveAt).getTime();
+  const turn    = game.fen.split(' ')[1]; // 'w' or 'b'
 
-  // NOTE: the timeout worker needs whitePlayerId to map turn→player.
-  // The select above must include whitePlayerId — add it:
-  //   whitePlayerId: true,  ← ADD to the select above in production
-  // For now we fall back to the simpler turn==='w' means p1 heuristic
-  // which is incorrect if white is player2. This is fixed in the full
-  // production version — see TIMEOUT_WORKER_FIX note below.
+  // Map FEN turn → which player slot (p1/p2) is active.
+  // white could be player1 or player2 — whitePlayerId is the source of truth.
+  const whiteIsP1 = game.whitePlayerId === game.player1Id;
+  const isP1Turn  = turn === 'w' ? whiteIsP1 : !whiteIsP1;
 
   const timebank  = isP1Turn ? game.player1Timebank : game.player2Timebank;
   const remaining = timebank - Math.max(0, elapsed - 30000);
@@ -404,7 +406,7 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
   );
 
   if (!result) {
-    console.log(`[Timeout] game ${gameId} already finished`);
+    logger.info(`[Timeout] game ${gameId} already finished`);
     return;
   }
 
@@ -443,24 +445,24 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
   });
 
   if (staleGames.length === 0) return;
-  console.log(`[Reconcile] found ${staleGames.length} stale active game(s)`);
+  logger.info(`[Reconcile] found ${staleGames.length} stale active game(s)`);
 
   for (const game of staleGames) {
     try {
       // Check if a timeout job already exists for this game (might be delayed)
       const existing = await timeoutQueue.getJob(`timeout-${game.id}`);
       if (existing) {
-        console.log(`[Reconcile] game ${game.id} has a pending timeout job, skipping`);
+        logger.info(`[Reconcile] game ${game.id} has a pending timeout job, skipping`);
         continue;
       }
 
-      // Determine who is timed out
+      // Map FEN turn → active player using whitePlayerId as source of truth
       const fenTurn   = (game.fen && game.fen.length > 0) ? game.fen.split(' ')[1] : 'w';
       const whiteIsP1 = game.whitePlayerId === game.player1Id;
-      const p1Active  = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1;
-      const winnerId  = p1Active ? game.player2Id : game.player1Id;
+      const isP1Turn  = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1;
+      const winnerId  = isP1Turn ? game.player2Id : game.player1Id;
 
-      console.log(`[Reconcile] force-finishing game ${game.id} (winner: ${winnerId})`);
+      logger.info(`[Reconcile] force-finishing game ${game.id} (winner: ${winnerId})`);
 
       const result = await finalizeGame(
         game.id, winnerId,
@@ -479,28 +481,28 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
         });
       }
     } catch (err) {
-      console.error(`[Reconcile] failed to process game ${game.id}:`, err.message);
+      logger.error(`[Reconcile] failed to process game ${game.id}:`, err.message);
     }
   }
 }, { connection: redisOpts, concurrency: 1 });
 
 // ─── Worker error handlers ─────────────────────────────────────────────────
 matchWorker.on('failed', (job, err) => {
-  console.error(`[match-worker] job ${job?.id} failed:`, err.message);
+  logger.error(`[match-worker] job ${job?.id} failed:`, err.message);
   if (job?.name === 'try-match') {
     matchQueue.add('try-match', {}, { delay: 5000 })
-      .catch(e => console.error('[match-worker] re-queue failed:', e.message));
+      .catch(e => logger.error('[match-worker] re-queue failed:', e.message));
   }
 });
-prepWorker.on('failed',      (job, err) => console.error(`[prep-worker] ${job?.id} failed:`, err.message));
-timeoutWorker.on('failed',   (job, err) => console.error(`[timeout-worker] ${job?.id} failed:`, err.message));
-reconcileWorker.on('failed', (job, err) => console.error(`[reconcile-worker] ${job?.id} failed:`, err.message));
+prepWorker.on('failed',      (job, err) => logger.error(`[prep-worker] ${job?.id} failed:`, err.message));
+timeoutWorker.on('failed',   (job, err) => logger.error(`[timeout-worker] ${job?.id} failed:`, err.message));
+reconcileWorker.on('failed', (job, err) => logger.error(`[reconcile-worker] ${job?.id} failed:`, err.message));
 
 for (const [name, w] of [
   ['match', matchWorker], ['prep', prepWorker],
   ['timeout', timeoutWorker], ['reconcile', reconcileWorker],
 ]) {
-  w.on('error', (err) => console.error(`[${name}-worker] error:`, err.message));
+  w.on('error', (err) => logger.error(`[${name}-worker] error:`, err.message));
 }
 
 // ─── Health server ─────────────────────────────────────────────────────────
@@ -519,28 +521,29 @@ const healthServer = http.createServer((req, res) => {
 // ─── Boot ──────────────────────────────────────────────────────────────────
 async function main() {
   await redisPublisher.connect();
-  console.log('[Redis] publisher connected');
-  console.log('[Matchmaker] workers started (match, prep, timeout, reconcile)');
+  logger.info('[Redis] publisher connected');
+  logger.info('[Matchmaker] workers started (match, prep, timeout, reconcile)');
 
   // Seed try-match if players are waiting
   const queuedCount = await prisma.user.count({ where: { queueStatus: 'queued' } });
   if (queuedCount >= 2) {
     await matchQueue.add('try-match', {}, { delay: 500 });
-    console.log(`[Boot] seeded try-match (${queuedCount} queued players)`);
+    logger.info(`[Boot] seeded try-match (${queuedCount} queued players)`);
   }
 
   // Reschedule timeout jobs for active games
   const activeGames = await prisma.game.findMany({
     where:  { status: 'active' },
-    select: { id: true, fen: true, lastMoveAt: true, player1Timebank: true, player2Timebank: true },
+    select: { id: true, fen: true, lastMoveAt: true, player1Id: true, whitePlayerId: true, player1Timebank: true, player2Timebank: true },
   });
   for (const g of activeGames) {
     if (!g.lastMoveAt) continue;
     const existing = await timeoutQueue.getJob(`timeout-${g.id}`);
     if (!existing) {
-      const turn = (g.fen && g.fen.length > 0) ? g.fen.split(' ')[1] : 'w';
-      await scheduleTimeout(g.id, g.player1Timebank, g.player2Timebank, g.lastMoveAt, turn);
-      console.log(`[Boot] rescheduled timeout for game ${g.id}`);
+      const turn      = (g.fen && g.fen.length > 0) ? g.fen.split(' ')[1] : 'w';
+      const whiteIsP1 = g.whitePlayerId === g.player1Id;
+      await scheduleTimeout(g.id, g.player1Timebank, g.player2Timebank, g.lastMoveAt, turn, whiteIsP1);
+      logger.info(`[Boot] rescheduled timeout for game ${g.id}`);
     }
   }
 
@@ -555,21 +558,21 @@ async function main() {
       const elapsed   = Date.now() - new Date(g.prepStartedAt).getTime();
       const remaining = Math.max(0, 62000 - elapsed);
       await prepQueue.add('prep-start', { gameId: g.id }, { delay: remaining, jobId: `prep-${g.id}` });
-      console.log(`[Boot] rescheduled prep-start for game ${g.id}`);
+      logger.info(`[Boot] rescheduled prep-start for game ${g.id}`);
     }
   }
 
   // Schedule first reconciliation run, then repeat every 5 minutes
   await reconcileQueue.add('reconcile', {}, { jobId: 'reconcile-singleton', repeat: { every: 5 * 60 * 1000 } });
-  console.log('[Boot] reconciliation job scheduled (every 5 min)');
+  logger.info('[Boot] reconciliation job scheduled (every 5 min)');
 
-  healthServer.listen(HEALTH_PORT, () => console.log(`[Health] listening on port ${HEALTH_PORT}`));
+  healthServer.listen(HEALTH_PORT, () => logger.info(`[Health] listening on port ${HEALTH_PORT}`));
   isHealthy = true;
 }
 
 // ─── Graceful shutdown ─────────────────────────────────────────────────────
 async function shutdown(signal) {
-  console.log(`[Matchmaker] ${signal} — shutting down`);
+  logger.info(`[Matchmaker] ${signal} — shutting down`);
   isHealthy = false;
   await Promise.all([
     matchWorker.close(), prepWorker.close(),
@@ -580,10 +583,10 @@ async function shutdown(signal) {
     timeoutQueue.close(), reconcileQueue.close(),
     redisPublisher.quit(),
   ]);
-  healthServer.close(() => { console.log('[Matchmaker] clean exit'); process.exit(0); });
+  healthServer.close(() => { logger.info('[Matchmaker] clean exit'); process.exit(0); });
   setTimeout(() => process.exit(1), 9000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-main().catch(err => { console.error('[Matchmaker] fatal:', err); process.exit(1); });
+main().catch(err => { logger.error({ err }, '[Matchmaker] fatal'); process.exit(1); });

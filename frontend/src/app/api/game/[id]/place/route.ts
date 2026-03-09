@@ -1,16 +1,13 @@
 // app/api/game/[id]/place/route.ts
 // CHANGES from original:
 //   - checkCsrf added (Step 3)
-//   - emitToGameUser calls preserved AS-IS (global set by server.ts)
-//   - publishGameUpdate added alongside emitToGameUser for Redis fan-out
+//   - masking moved to server.ts subscriber; place route publishes raw FEN via Redis
 //   - No logic changes
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import {
-  buildCombinedDraftFen,
-  maskOpponentAuxPlacements,
   getPieceAt,
   placePieceOnFen,
   hasIllegalBattery,
@@ -56,8 +53,6 @@ export async function POST(
       player1Id: true,
       player2Id: true,
       whitePlayerId: true,
-      draft1: { select: { fen: true } },
-      draft2: { select: { fen: true } },
     },
   });
 
@@ -140,36 +135,15 @@ export async function POST(
     select: { auxPointsPlayer1: true, auxPointsPlayer2: true },
   });
 
-  // ── Per-player masked broadcasts ──────────────────────────────────────────
-  // emitToGameUser: direct socket emit via server.ts global (same-process only)
-  // publishGameUpdate: Redis pub/sub for multi-instance support
-  // Both are sent; server.ts deduplicates if both are received.
-  const emitToGameUser = (global as any).emitToGameUser;
-
-  if (game.draft1?.fen && game.draft2?.fen) {
-    const originalFen = buildCombinedDraftFen(game.draft1.fen, game.draft2.fen);
-
-    const placerMaskedFen   = maskOpponentAuxPlacements(newFen, originalFen, isWhite);
-    const opponentId        = isPlayer1 ? game.player2Id : game.player1Id;
-    const opponentIsWhite   = !isWhite;
-    const opponentMaskedFen = maskOpponentAuxPlacements(newFen, originalFen, opponentIsWhite);
-
-    const placerPayload   = { fen: placerMaskedFen,   auxPointsPlayer1: updatedGame?.auxPointsPlayer1, auxPointsPlayer2: updatedGame?.auxPointsPlayer2 };
-    const opponentPayload = { fen: opponentMaskedFen, auxPointsPlayer1: updatedGame?.auxPointsPlayer1, auxPointsPlayer2: updatedGame?.auxPointsPlayer2 };
-
-    if (emitToGameUser) {
-      emitToGameUser(gameId, userId,      "game-update", placerPayload);
-      emitToGameUser(gameId, opponentId,  "game-update", opponentPayload);
-    }
-
-    // For Redis pub/sub: publish the unmasked FEN; the socket server subscriber
-    // applies maskOpponentAuxPlacements per-player before forwarding to clients.
-    await publishGameUpdate(gameId, {
-      fen: newFen,
-      auxPointsPlayer1: updatedGame?.auxPointsPlayer1,
-      auxPointsPlayer2: updatedGame?.auxPointsPlayer2,
-    });
-  }
+  // ── Broadcast ─────────────────────────────────────────────────────────────
+  // Publish the raw (unmasked) FEN to Redis. The server.ts subscriber applies
+  // per-player maskOpponentAuxPlacements before forwarding to each client,
+  // so neither player sees the other's unrevealed pieces.
+  await publishGameUpdate(gameId, {
+    fen: newFen,
+    auxPointsPlayer1: updatedGame?.auxPointsPlayer1,
+    auxPointsPlayer2: updatedGame?.auxPointsPlayer2,
+  });
 
   return NextResponse.json({ success: true });
 }

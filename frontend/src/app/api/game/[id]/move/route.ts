@@ -123,15 +123,12 @@ export async function POST(
 
     if (result) {
       await cancelTimeoutJob(gameId);
-      const timeoutPayload = {
+      await publishGameUpdate(gameId, {
         status: "finished", winnerId, endReason: "timeout",
         player1EloAfter: result.newPlayer1Elo,
         player2EloAfter: result.newPlayer2Elo,
         eloChange:       result.eloChange,
-      };
-      const emitFn = (global as any).emitToGame;
-      if (emitFn) emitFn(gameId, "game-update", timeoutPayload);
-      await publishGameUpdate(gameId, timeoutPayload);
+      });
     }
 
     return NextResponse.json(
@@ -238,8 +235,6 @@ export async function POST(
     }
   }
 
-  const emitFn = (global as any).emitToGame;
-  if (emitFn) emitFn(gameId, "game-update", broadcastPayload);
   await publishGameUpdate(gameId, broadcastPayload);
 
   // ─── Schedule / cancel timeout ────────────────────────────────────────────
