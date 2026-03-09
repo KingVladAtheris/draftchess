@@ -3,17 +3,30 @@
 //
 // Uses useSession() from next-auth/react so the nav updates reactively
 // when the user signs in or out — no server re-render required.
+//
+// CHANGES:
+//   - Added NotificationsBell with friend request inbox
+//   - Fixed Profile link to use username instead of userId
+//   - Profile no longer marked soon: true
 
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { useSession, signOut } from "next-auth/react";
+import { apiFetch } from "@/app/lib/api-fetch";
 
 // ─── Icons ──────────────────────────────────────────────────────────────────
 const ChevronDown = ({ className }: { className?: string }) => (
   <svg className={className} width="12" height="12" viewBox="0 0 12 12" fill="none">
     <path d="M2 4L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
+const BellIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+    <path d="M8 1.5A4.5 4.5 0 0 0 3.5 6v2.5L2 10h12l-1.5-1.5V6A4.5 4.5 0 0 0 8 1.5Z" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M6.5 10.5a1.5 1.5 0 0 0 3 0" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
   </svg>
 );
 
@@ -28,6 +41,14 @@ type DropdownItem =
   | { type: "link";   label: string; href: string;        soon?: boolean; danger?: boolean }
   | { type: "button"; label: string; onClick: () => void; soon?: boolean; danger?: boolean }
   | { type: "divider" };
+
+type Notification = {
+  id:        string;
+  type:      "friend_request";
+  requestId: number;
+  sender:    { id: number; username: string; image: string | null };
+  createdAt: string;
+};
 
 // ─── Shared dropdown panel ───────────────────────────────────────────────────
 function DropdownPanel({ items, isOpen, align = "left" }: {
@@ -100,6 +121,139 @@ function NavDropdown({ label, items }: { label: string; items: DropdownItem[] })
   );
 }
 
+// ─── Notifications bell ───────────────────────────────────────────────────────
+function NotificationsBell() {
+  const [open, setOpen]                   = useState(false);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [loading, setLoading]             = useState(false);
+  const [acting, setActing]               = useState<number | null>(null);
+  const ref                               = useRef<HTMLDivElement>(null);
+
+  const fetchNotifications = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/notifications");
+      if (res.ok) {
+        const data = await res.json();
+        setNotifications(data.notifications ?? []);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Load on mount
+  useEffect(() => { fetchNotifications(); }, [fetchNotifications]);
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const handleOpen = () => {
+    setOpen(o => !o);
+    if (!open) fetchNotifications(); // refresh on open
+  };
+
+  const handleAction = async (requestId: number, action: "accept" | "decline") => {
+    setActing(requestId);
+    try {
+      const res = await apiFetch(`/api/friends/${requestId}`, {
+        method:  "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ action }),
+      });
+      if (res.ok) {
+        setNotifications(prev => prev.filter(n => n.requestId !== requestId));
+      }
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const count = notifications.length;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={handleOpen}
+        className={`relative flex items-center justify-center w-9 h-9 rounded-lg transition-colors duration-150
+          ${open ? "text-white bg-white/8" : "text-white/50 hover:text-white hover:bg-white/6"}`}
+      >
+        <BellIcon />
+        {count > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center leading-none">
+            {count > 9 ? "9+" : count}
+          </span>
+        )}
+      </button>
+
+      <div className={`
+        absolute top-[calc(100%+8px)] right-0 w-72 z-50
+        bg-[#1a1d2e] border border-white/10 rounded-xl shadow-2xl shadow-black/60
+        overflow-hidden transition-all duration-150 origin-top-right
+        ${open ? "opacity-100 scale-100 pointer-events-auto" : "opacity-0 scale-95 pointer-events-none"}
+      `}>
+        <div className="px-4 py-3 border-b border-white/8 flex items-center justify-between">
+          <span className="text-xs font-bold uppercase tracking-wider text-white/40">Notifications</span>
+          {count > 0 && <span className="text-xs text-white/30">{count} pending</span>}
+        </div>
+
+        {loading ? (
+          <div className="px-4 py-6 text-center text-white/30 text-sm">Loading…</div>
+        ) : notifications.length === 0 ? (
+          <div className="px-4 py-6 text-center text-white/25 text-sm">No notifications</div>
+        ) : (
+          <div className="max-h-80 overflow-y-auto">
+            {notifications.map(n => (
+              <div key={n.id} className="px-4 py-3 border-b border-white/6 last:border-0">
+                <div className="flex items-start gap-3">
+                  <div className="w-8 h-8 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 text-xs font-bold flex-shrink-0">
+                    {n.sender.username[0].toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-white/80 leading-snug">
+                      <Link
+                        href={`/profile/${n.sender.username}`}
+                        className="font-semibold hover:text-white transition-colors"
+                        onClick={() => setOpen(false)}
+                      >
+                        {n.sender.username}
+                      </Link>
+                      {" "}sent you a friend request
+                    </p>
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => handleAction(n.requestId, "accept")}
+                        disabled={acting === n.requestId}
+                        className="px-3 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/25 transition-colors disabled:opacity-50"
+                      >
+                        {acting === n.requestId ? "…" : "Accept"}
+                      </button>
+                      <button
+                        onClick={() => handleAction(n.requestId, "decline")}
+                        disabled={acting === n.requestId}
+                        className="px-3 py-1 rounded-lg border border-white/10 text-white/40 text-xs font-semibold hover:border-white/20 hover:text-white/60 transition-colors disabled:opacity-50"
+                      >
+                        {acting === n.requestId ? "…" : "Decline"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── User dropdown ────────────────────────────────────────────────────────────
 function UserDropdown() {
   const { data: session } = useSession();
@@ -117,13 +271,13 @@ function UserDropdown() {
 
   if (!session?.user) return null;
 
-  const user    = session.user;
-  const initial = (user.name ?? user.email ?? "?")[0].toUpperCase();
-  const userId  = (user as any).id;
+  const user     = session.user;
+  const initial  = (user.name ?? user.email ?? "?")[0].toUpperCase();
+  const username = (user as any).username as string | undefined;
 
   const items: DropdownItem[] = [
-    { type: "link",   label: "Profile",  href: `/profile/${userId ?? "me"}`, soon: true },
-    { type: "link",   label: "Settings", href: "/settings",                  soon: true },
+    { type: "link",   label: "Profile",  href: username ? `/profile/${username}` : "/profile" },
+    { type: "link",   label: "Settings", href: "/settings", soon: true },
     { type: "divider" },
     { type: "button", label: "Sign out", onClick: () => signOut({ callbackUrl: "/" }), danger: true },
   ];
@@ -235,6 +389,7 @@ export default function Nav() {
             <div className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-white/25 cursor-not-allowed select-none mr-1">
               Leaderboard <SoonPill />
             </div>
+            <NotificationsBell />
             <UserDropdown />
           </>
         ) : status === "unauthenticated" ? (

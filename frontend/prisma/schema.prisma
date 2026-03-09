@@ -1,17 +1,40 @@
 // prisma/schema.prisma
-// CHANGE: currentForUserId and the UserCurrentGames relation removed entirely.
-// The field was deprecated and only ever set to null on game finish.
-// Any code that references currentForUserId has been removed from elo-update.ts
-// and matchmaker/index.js in subsequent steps.
 
 datasource db {
-  provider = "postgresql"
+  provider  = "postgresql"
 }
 
 generator client {
   provider = "prisma-client-js"
 }
 
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+// Game mode. Drives budget limits and ELO separation.
+//   standard: 33pt draft, 6pt prep
+//   pauper:   18pt draft, 3pt prep
+//   royal:    48pt draft, 12pt prep
+enum GameMode {
+  standard
+  pauper
+  royal
+}
+
+enum TournamentFormat {
+  single_elimination
+  swiss
+  round_robin
+  arena
+}
+
+enum TournamentStatus {
+  upcoming
+  active
+  finished
+  cancelled
+}
+
+// ─── User ──────────────────────────────────────────────────────────────────
 model User {
   id            Int       @id @default(autoincrement())
   username      String    @unique
@@ -22,61 +45,103 @@ model User {
   image         String?
   createdAt     DateTime  @default(now())
 
-  // ELO rating system
-  elo           Int       @default(1200)
-  gamesPlayed   Int       @default(0)
-  wins          Int       @default(0)
-  losses        Int       @default(0)
-  draws         Int       @default(0)
+  // Per-mode ELO — separate ratings and counters per mode
+  eloStandard         Int @default(1200)
+  eloPauper           Int @default(1200)
+  eloRoyal            Int @default(1200)
+
+  gamesPlayedStandard Int @default(0)
+  gamesPlayedPauper   Int @default(0)
+  gamesPlayedRoyal    Int @default(0)
+
+  winsStandard        Int @default(0)
+  winsPauper          Int @default(0)
+  winsRoyal           Int @default(0)
+
+  lossesStandard      Int @default(0)
+  lossesPauper        Int @default(0)
+  lossesRoyal         Int @default(0)
+
+  drawsStandard       Int @default(0)
+  drawsPauper         Int @default(0)
+  drawsRoyal          Int @default(0)
 
   // Queue & game state
   queueStatus   String?   @default("offline")
   queuedAt      DateTime?
   queuedDraftId Int?
+  queuedMode    GameMode? // which mode they queued for
 
   // Relations
-  drafts         Draft[]
-  queuedDraft    Draft?    @relation("UserQueuedDraft", fields: [queuedDraftId], references: [id], onDelete: SetNull)
-  gamesAsPlayer1 Game[]    @relation("Player1")
-  gamesAsPlayer2 Game[]    @relation("Player2")
-  gamesAsWhite   Game[]    @relation("WhitePlayer")
-  accounts       Account[]
-  sessions       Session[]
+  drafts            Draft[]
+  queuedDraft       Draft?             @relation("UserQueuedDraft", fields: [queuedDraftId], references: [id], onDelete: SetNull)
+  gamesAsPlayer1    Game[]             @relation("Player1")
+  gamesAsPlayer2    Game[]             @relation("Player2")
+  gamesAsWhite      Game[]             @relation("WhitePlayer")
+  tokens            UserToken[]
+  tournamentEntries TournamentPlayer[]
+  following         UserFollow[]       @relation("Follower")
+  followers         UserFollow[]       @relation("Following")
+  sentRequests      FriendRequest[]    @relation("SentRequests")
+  receivedRequests  FriendRequest[]    @relation("ReceivedRequests")
+  accounts          Account[]
+  sessions          Session[]
 
   @@index([queueStatus])
   @@index([queuedDraftId])
-  @@index([elo])
+  @@index([eloStandard])
+  @@index([eloPauper])
+  @@index([eloRoyal])
 }
 
+// ─── Draft ─────────────────────────────────────────────────────────────────
+model Draft {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  name      String?
+  fen       String
+  points    Int
+  mode      GameMode @default(standard)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  queuedByUsers User[] @relation("UserQueuedDraft")
+  gamesAsDraft1 Game[] @relation("GameDraft1")
+  gamesAsDraft2 Game[] @relation("GameDraft2")
+
+  @@index([userId])
+  @@index([userId, mode])
+  @@index([updatedAt])
+}
+
+// ─── Game ──────────────────────────────────────────────────────────────────
 model Game {
-  id               Int       @id @default(autoincrement())
+  id               Int      @id @default(autoincrement())
   player1Id        Int
   player2Id        Int
-  // whitePlayerId: the user who plays white. Always set at game creation.
-  // draft1 = white's draft, draft2 = black's draft.
   whitePlayerId    Int
-  status           String    @default("waiting")
+  mode             GameMode @default(standard)
+  status           String   @default("waiting")
   draft1Id         Int?
   draft2Id         Int?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
   fen              String?
   prepStartedAt    DateTime?
-  readyPlayer1     Boolean   @default(false)
-  readyPlayer2     Boolean   @default(false)
-  auxPointsPlayer1 Int       @default(6)
-  auxPointsPlayer2 Int       @default(6)
+  readyPlayer1     Boolean  @default(false)
+  readyPlayer2     Boolean  @default(false)
+  auxPointsPlayer1 Int      @default(6)
+  auxPointsPlayer2 Int      @default(6)
 
-  // Time control system
-  lastMoveAt       DateTime?
-  lastMoveBy       Int?
-  moveNumber       Int        @default(0)
+  // Time control
+  lastMoveAt      DateTime?
+  lastMoveBy      Int?
+  moveNumber      Int       @default(0)
+  player1Timebank Int       @default(60000)
+  player2Timebank Int       @default(60000)
 
-  // Per-player timebanks (in milliseconds)
-  player1Timebank  Int        @default(60000)
-  player2Timebank  Int        @default(60000)
-
-  // Game result and ELO tracking
+  // Result & ELO
   winnerId         Int?
   player1EloBefore Int?
   player2EloBefore Int?
@@ -85,45 +150,131 @@ model Game {
   eloChange        Int?
   endReason        String?
 
+  // PGN stored on finish for the replayer
+  pgn              String?  @db.Text
+
+  // Rematch — set when a player requests a rematch after the game ends.
+  // Cleared when rematch is accepted (new game created) or declined.
+  rematchRequestedBy Int?
+
+  // Tournament context — null for casual games
+  tournamentId    Int?
+  tournamentRound Int?
+
   // Relations
-  player1     User   @relation("Player1",     fields: [player1Id],     references: [id], onDelete: Cascade)
-  player2     User   @relation("Player2",     fields: [player2Id],     references: [id], onDelete: Cascade)
-  whitePlayer User   @relation("WhitePlayer", fields: [whitePlayerId], references: [id], onDelete: Cascade)
-  draft1      Draft? @relation("GameDraft1",  fields: [draft1Id],      references: [id], onDelete: SetNull)
-  draft2      Draft? @relation("GameDraft2",  fields: [draft2Id],      references: [id], onDelete: SetNull)
+  player1     User        @relation("Player1",     fields: [player1Id],     references: [id], onDelete: Cascade)
+  player2     User        @relation("Player2",     fields: [player2Id],     references: [id], onDelete: Cascade)
+  whitePlayer User        @relation("WhitePlayer", fields: [whitePlayerId], references: [id], onDelete: Cascade)
+  draft1      Draft?      @relation("GameDraft1",  fields: [draft1Id],      references: [id], onDelete: SetNull)
+  draft2      Draft?      @relation("GameDraft2",  fields: [draft2Id],      references: [id], onDelete: SetNull)
+  tournament  Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
 
   @@index([player1Id])
   @@index([player2Id])
   @@index([whitePlayerId])
   @@index([status])
+  @@index([mode])
   @@index([createdAt])
   @@index([draft1Id])
   @@index([draft2Id])
   @@index([winnerId])
   @@index([lastMoveAt])
-  // Compound index for the reconciliation query (WHERE status='active' AND lastMoveAt < cutoff)
+  @@index([tournamentId])
   @@index([status, lastMoveAt])
+  @@index([player1Id, mode, createdAt])
+  @@index([player2Id, mode, createdAt])
 }
 
-model Draft {
-  id        Int      @id @default(autoincrement())
+// ─── Tokens ────────────────────────────────────────────────────────────────
+// TokenDefinition is the catalogue of token types.
+// UserToken is the join table of which users hold which tokens.
+//
+// Examples:
+//   slug: "founder"  label: "Founder"        icon: "🏅"
+//   slug: "premium"  label: "Premium"         icon: "⭐"
+//   slug: "beta"     label: "Beta Tester"     icon: "🧪"
+//   slug: "champion" label: "Tournament Champion" icon: "🏆"
+
+model TokenDefinition {
+  id          Int       @id @default(autoincrement())
+  slug        String    @unique
+  label       String
+  description String?
+  icon        String?
+  color       String?
+  // adminOnly: if true only admins can assign it.
+  // if false it can be auto-granted by gameplay logic.
+  adminOnly   Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+
+  holders     UserToken[]
+
+  @@index([slug])
+}
+
+model UserToken {
+  id        Int             @id @default(autoincrement())
   userId    Int
-  name      String?
-  fen       String
-  points    Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  tokenId   Int
+  grantedAt DateTime        @default(now())
+  grantedBy Int?            // userId of admin who granted, null if auto-granted
+  expiresAt DateTime?       // null = permanent
+  note      String?
 
-  // Relations
-  user          User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  queuedByUsers User[] @relation("UserQueuedDraft")
-  gamesAsDraft1 Game[] @relation("GameDraft1")
-  gamesAsDraft2 Game[] @relation("GameDraft2")
+  user  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token TokenDefinition @relation(fields: [tokenId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, tokenId])
   @@index([userId])
-  @@index([updatedAt])
+  @@index([tokenId])
+  @@index([expiresAt])
 }
 
+// ─── Tournament ────────────────────────────────────────────────────────────
+model Tournament {
+  id                 Int              @id @default(autoincrement())
+  name               String
+  description        String?          @db.Text
+  mode               GameMode         @default(standard)
+  format             TournamentFormat @default(single_elimination)
+  status             TournamentStatus @default(upcoming)
+  registrationEndsAt DateTime?
+  startsAt           DateTime?
+  finishedAt         DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  maxPlayers         Int?
+  minPlayers         Int              @default(2)
+  prizeDescription   String?
+  winnerId           Int?
+
+  players TournamentPlayer[]
+  games   Game[]
+
+  @@index([status])
+  @@index([mode])
+  @@index([startsAt])
+}
+
+model TournamentPlayer {
+  id           Int      @id @default(autoincrement())
+  tournamentId Int
+  userId       Int
+  registeredAt DateTime @default(now())
+  score        Float    @default(0)
+  rank         Int?
+  eliminated   Boolean  @default(false)
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tournamentId, userId])
+  @@index([tournamentId])
+  @@index([userId])
+  @@index([tournamentId, score])
+}
+
+// ─── Auth (unchanged) ──────────────────────────────────────────────────────
 model Account {
   id                String  @id @default(cuid())
   userId            Int
@@ -161,4 +312,44 @@ model VerificationToken {
   expires    DateTime
 
   @@unique([identifier, token])
+}
+
+// ─── Friends / Follow ──────────────────────────────────────────────────────
+// UserFollow: unilateral follow (like Twitter).
+// FriendRequest: mutual friendship requiring acceptance.
+// A friendship = FriendRequest with status "accepted" in either direction.
+// Online presence is tracked in Redis (TTL per userId), not in the DB.
+// Challenge requests are sent via socket events, not stored in DB.
+
+model UserFollow {
+  id          Int      @id @default(autoincrement())
+  followerId  Int
+  followingId Int
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("Follower",  fields: [followerId],  references: [id], onDelete: Cascade)
+  following User @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+// FriendRequest status values: "pending" | "accepted" | "declined"
+model FriendRequest {
+  id         Int      @id @default(autoincrement())
+  senderId   Int
+  receiverId Int
+  status     String   @default("pending")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  sender   User @relation("SentRequests",     fields: [senderId],   references: [id], onDelete: Cascade)
+  receiver User @relation("ReceivedRequests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  // Only one active request between any two users at a time
+  @@unique([senderId, receiverId])
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([receiverId, status]) // fetch pending incoming requests efficiently
 }

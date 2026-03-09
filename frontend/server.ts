@@ -70,7 +70,7 @@ app.prepare().then(async () => {
     handle(req, res, parsedUrl);
   });
 
-  const allowedOrigin = process.env.APP_URL || 'http://localhost:3000';
+  const allowedOrigin = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
   const ioOptions: Partial<ServerOptions> = {
     path:             '/api/socket.io',
@@ -121,9 +121,17 @@ app.prepare().then(async () => {
     const userId = socket.data.userId as number;
     logger.debug({ socketId: socket.id, userId }, '[Socket.IO] connected');
 
+    // Mark user as online — TTL 70s, refreshed by client heartbeat every 60s
+    cmdClient.set(`online:${userId}`, '1', { EX: 70 }).catch(() => {});
+
     socket.join(`queue-user-${userId}`);
     socket.on('join-queue',  () => socket.join('queue'));
     socket.on('leave-queue', () => socket.leave('queue'));
+
+    // Client sends heartbeat every 60s to keep online presence alive
+    socket.on('heartbeat', () => {
+      cmdClient.set(`online:${userId}`, '1', { EX: 70 }).catch(() => {});
+    });
 
     // ── join-game ─────────────────────────────────────────────────────────────
     socket.on('join-game', async (gameId: number) => {
@@ -230,6 +238,9 @@ app.prepare().then(async () => {
     // ── disconnect ─────────────────────────────────────────────────────────────
     socket.on('disconnect', async (reason) => {
       logger.debug({ socketId: socket.id, userId, reason }, '[Socket.IO] disconnected');
+
+      // Clear online presence immediately on disconnect
+      cmdClient.del(`online:${userId}`).catch(() => {});
 
       try {
         const user = await prisma.user.findUnique({

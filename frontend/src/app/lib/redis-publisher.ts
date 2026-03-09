@@ -39,6 +39,11 @@ async function getPublisher(): Promise<RedisClientType> {
   return _publisher!;
 }
 
+// ── Generic Redis client for read operations (e.g. online presence mGet) ──
+export async function getRedisClient(): Promise<RedisClientType> {
+  return getPublisher();
+}
+
 // ── publish a game-room event ─────────────────────────────────────────────
 // The socket server's subscriber emits this to `game-{gameId}` room.
 export async function publishGameUpdate(

@@ -5,6 +5,7 @@ import { io, type Socket } from 'socket.io-client';
 
 let socket: Socket | null = null;
 let connectPromise: Promise<Socket> | null = null;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
 const SOCKET_URL = undefined;
 
@@ -32,8 +33,20 @@ export const getSocket = (): Promise<Socket> => {
       autoConnect:         false,
     });
 
+    socket.on('connect', () => {
+      // Start heartbeat — refreshes online:userId key in Redis every 60s
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      heartbeatInterval = setInterval(() => {
+        if (socket?.connected) socket.emit('heartbeat');
+      }, 60_000);
+    });
+
     socket.on('disconnect', (reason: string) => {
       console.log(`Socket disconnected: ${reason}`);
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
       if (!socket?.connected) {
         connectPromise = null;
       }

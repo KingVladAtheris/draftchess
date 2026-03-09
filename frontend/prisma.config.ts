@@ -1,4 +1,4 @@
-// prisma/prisma.config.ts (minimal & correct for your stage)
+//frontend/prisma.config.ts
 import 'dotenv/config';
 import { defineConfig, env } from 'prisma/config';
 
