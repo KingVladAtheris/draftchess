@@ -1,7 +1,7 @@
 "use client";
 // src/app/profile/[username]/ProfileClient.tsx
 
-import { useState, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { apiFetch } from "@/app/lib/api-fetch";
 
@@ -374,23 +374,157 @@ function StatsTab({ profile, eloHistory }: { profile: Profile; eloHistory: Props
   );
 }
 
+// ─── Shared: Social user row ───────────────────────────────────────────────
+type SocialUser = {
+  id: number;
+  username: string;
+  image: string | null;
+  eloStandard: number;
+  eloPauper: number;
+  eloRoyal: number;
+  online: boolean;
+};
+
+function SocialUserRow({ user }: { user: SocialUser }) {
+  return (
+    <Link
+      href={`/profile/${user.username}`}
+      className="flex items-center gap-3 px-4 py-3 rounded-xl border border-white/6 bg-white/[0.02] hover:bg-white/[0.05] hover:border-white/12 transition-all group"
+    >
+      {/* Avatar + online dot */}
+      <div className="relative flex-shrink-0">
+        <div className="w-9 h-9 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 text-sm font-bold">
+          {user.image
+            ? <img src={user.image} alt={user.username} className="w-full h-full rounded-full object-cover" />
+            : user.username[0].toUpperCase()
+          }
+        </div>
+        <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0f1117] ${user.online ? "bg-emerald-400" : "bg-white/20"}`} />
+      </div>
+
+      {/* Name */}
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-semibold text-white/80 group-hover:text-white transition-colors truncate">
+          {user.username}
+        </p>
+        <p className="text-[11px] text-white/30 mt-0.5">
+          {user.online ? "Online" : "Offline"} · {user.eloStandard} ELO
+        </p>
+      </div>
+
+      {/* ELO chips */}
+      <div className="hidden sm:flex items-center gap-1.5 flex-shrink-0">
+        {[
+          { label: "S", elo: user.eloStandard },
+          { label: "P", elo: user.eloPauper },
+          { label: "R", elo: user.eloRoyal },
+        ].map(m => (
+          <div key={m.label} className="flex flex-col items-center px-2 py-1 rounded-lg bg-white/[0.04] border border-white/6">
+            <span className="text-[9px] font-bold uppercase tracking-wider text-white/25">{m.label}</span>
+            <span className="text-xs font-bold text-white/60 tabular-nums">{m.elo}</span>
+          </div>
+        ))}
+      </div>
+    </Link>
+  );
+}
+
+function useSocialList(url: string) {
+  const [users, setUsers]     = useState<SocialUser[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        const list: SocialUser[] = data.friends ?? data.following ?? [];
+        // Sort: online first, then alphabetically within each group
+        list.sort((a, b) => {
+          if (a.online !== b.online) return a.online ? -1 : 1;
+          return a.username.localeCompare(b.username);
+        });
+        setUsers(list);
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [url]);
+
+  return { users, loading };
+}
+
 // ─── Tab: Friends ──────────────────────────────────────────────────────────
-function FriendsTab({ profile }: { profile: Profile }) {
+function FriendsTab({ isOwnProfile }: { isOwnProfile: boolean }) {
+  const { users, loading } = useSocialList("/api/friends");
+
+  if (!isOwnProfile) {
+    return (
+      <p className="text-white/30 text-sm py-8 text-center">
+        Friends list is only visible to the account owner.
+      </p>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {[1,2,3].map(i => (
+          <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />
+        ))}
+      </div>
+    );
+  }
+
+  if (users.length === 0) {
+    return <p className="text-white/25 text-sm py-8 text-center">No friends yet.</p>;
+  }
+
+  const online = users.filter(u => u.online);
+
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4 text-center">
-          <p className="text-2xl font-bold text-white">{profile.followerCount}</p>
-          <p className="text-xs text-white/35 mt-1">Followers</p>
-        </div>
-        <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4 text-center">
-          <p className="text-2xl font-bold text-white">{profile.followingCount}</p>
-          <p className="text-xs text-white/35 mt-1">Following</p>
-        </div>
-      </div>
-      <p className="text-white/25 text-sm text-center py-8">
-        Detailed friends list coming soon.
+      <p className="text-xs text-white/30 font-medium">
+        {users.length} friend{users.length !== 1 ? "s" : ""} · {online.length} online
       </p>
+      <div className="space-y-2">
+        {users.map(u => <SocialUserRow key={u.id} user={u} />)}
+      </div>
+    </div>
+  );
+}
+
+// ─── Tab: Following ────────────────────────────────────────────────────────
+function FollowingTab({ username, isOwnProfile }: { username: string; isOwnProfile: boolean }) {
+  // Own profile → use /api/following (returns own list with online status from Redis)
+  // Other profile → use public /api/profile/[username]/following
+  const url = isOwnProfile ? "/api/following" : `/api/profile/${username}/following`;
+  const { users, loading } = useSocialList(url);
+
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {[1,2,3].map(i => (
+          <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />
+        ))}
+      </div>
+    );
+  }
+
+  if (users.length === 0) {
+    return <p className="text-white/25 text-sm py-8 text-center">
+      {isOwnProfile ? "You aren’t following anyone yet." : "Not following anyone."}
+    </p>;
+  }
+
+  const online = users.filter(u => u.online);
+
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-white/30 font-medium">
+        {users.length} following · {online.length} online
+      </p>
+      <div className="space-y-2">
+        {users.map(u => <SocialUserRow key={u.id} user={u} />)}
+      </div>
     </div>
   );
 }
@@ -408,7 +542,7 @@ function TokensTab({ tokens }: { tokens: Token[] }) {
 }
 
 // ─── Main Component ────────────────────────────────────────────────────────
-type Tab = "overview" | "games" | "stats" | "friends" | "tokens";
+type Tab = "overview" | "games" | "stats" | "friends" | "following" | "tokens";
 
 export default function ProfileClient({ profile, games, eloHistory, isOwnProfile, isFollowing, friendStatus: initialFriendStatus, friendRequestId: initialRequestId, viewerId }: Props) {
   const [activeTab, setActiveTab]     = useState<Tab>("overview");
@@ -472,8 +606,9 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
     { key: "overview", label: "Overview" },
     { key: "games",    label: "Games" },
     { key: "stats",    label: "Stats" },
-    { key: "friends",  label: "Friends" },
-    { key: "tokens",   label: "Tokens" },
+    { key: "friends",   label: "Friends" },
+    { key: "following", label: "Following" },
+    { key: "tokens",    label: "Tokens" },
   ];
 
   const joinedYear = new Date(profile.createdAt).getFullYear();
@@ -555,7 +690,8 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
       {activeTab === "overview" && <OverviewTab profile={profile} games={games} eloHistory={eloHistory} />}
       {activeTab === "games"    && <GamesTab games={games} />}
       {activeTab === "stats"    && <StatsTab profile={profile} eloHistory={eloHistory} />}
-      {activeTab === "friends"  && <FriendsTab profile={profile} />}
+      {activeTab === "friends"   && <FriendsTab isOwnProfile={isOwnProfile} />}
+      {activeTab === "following"  && <FollowingTab username={profile.username} isOwnProfile={isOwnProfile} />}
       {activeTab === "tokens"   && <TokensTab tokens={profile.tokens} />}
     </div>
   );

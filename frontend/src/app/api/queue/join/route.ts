@@ -1,10 +1,15 @@
 // src/app/api/queue/join/route.ts
+// CHANGES:
+//   - Reads draft.mode and validates the draft budget is correct for that mode.
+//   - Writes queuedMode to the user record alongside queuedDraftId.
+
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { triggerMatchmaking } from "@/app/lib/queue-join";
 import { consume, queueLimiter } from "@/app/lib/rate-limit";
 import { checkCsrf } from "@/app/lib/csrf";
+import { modeBudget, type GameMode } from "@/app/lib/game-modes";
 
 export async function POST(req: NextRequest) {
   const csrfError = checkCsrf(req);
@@ -46,11 +51,22 @@ export async function POST(req: NextRequest) {
     }
 
     const draft = await prisma.draft.findFirst({
-      where: { id: draftId, userId },
+      where:  { id: draftId, userId },
+      select: { id: true, mode: true, points: true },
     });
 
     if (!draft) {
       return NextResponse.json({ error: "Draft not found or not owned" }, { status: 403 });
+    }
+
+    // Validate the draft's point total doesn't exceed the mode budget.
+    // This guards against drafts edited to be over-budget before queuing.
+    const budget = modeBudget(draft.mode as GameMode);
+    if (draft.points > budget) {
+      return NextResponse.json(
+        { error: `Draft exceeds ${draft.mode} budget (${draft.points}/${budget} points)` },
+        { status: 400 }
+      );
     }
 
     const limited = await consume(queueLimiter, req, userId.toString());
@@ -62,6 +78,7 @@ export async function POST(req: NextRequest) {
         queueStatus:   "queued",
         queuedAt:      new Date(),
         queuedDraftId: draftId,
+        queuedMode:    draft.mode,
       },
     });
 

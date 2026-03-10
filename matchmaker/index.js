@@ -42,6 +42,22 @@ redisPublisher.on('error', (err) => logger.error('[Redis] pub error:', err));
 const GAME_EVENTS_CHANNEL  = 'draftchess:game-events';
 const MIN_ELO              = 100;
 
+// ─── Mode config (mirrors src/app/lib/game-modes.ts) ──────────────────────
+const MODE_CONFIG = {
+  standard: { draftBudget: 33, auxPoints: 6  },
+  pauper:   { draftBudget: 18, auxPoints: 3  },
+  royal:    { draftBudget: 48, auxPoints: 12 },
+};
+const ELO_FIELD = {
+  standard: 'eloStandard', pauper: 'eloPauper', royal: 'eloRoyal',
+};
+const GAMES_PLAYED_FIELD = {
+  standard: 'gamesPlayedStandard', pauper: 'gamesPlayedPauper', royal: 'gamesPlayedRoyal',
+};
+const WINS_FIELD   = { standard: 'winsStandard',   pauper: 'winsPauper',   royal: 'winsRoyal'   };
+const LOSSES_FIELD = { standard: 'lossesStandard', pauper: 'lossesPauper', royal: 'lossesRoyal' };
+const DRAWS_FIELD  = { standard: 'drawsStandard',  pauper: 'drawsPauper',  royal: 'drawsRoyal'  };
+
 // ─── Publish helpers ───────────────────────────────────────────────────────
 async function publishEvent(type, payload) {
   try {
@@ -90,7 +106,7 @@ function calculateEloChange(winnerElo, loserElo, winnerGames, isDraw = false) {
 }
 
 async function finalizeGame(gameId, winnerId, player1Id, player2Id,
-                             p1EloBefore, p2EloBefore, p1Games, p2Games, endReason) {
+                             p1EloBefore, p2EloBefore, p1Games, p2Games, endReason, mode = 'standard') {
   const isDraw = winnerId === null;
   let p1Change, p2Change;
 
@@ -131,26 +147,33 @@ async function finalizeGame(gameId, winnerId, player1Id, player2Id,
         },
       });
 
-      const queueReset = { queueStatus: 'offline', queuedAt: null, queuedDraftId: null };
+      const eloF    = ELO_FIELD[mode]          || 'eloStandard';
+      const gamesF  = GAMES_PLAYED_FIELD[mode] || 'gamesPlayedStandard';
+      const winsF   = WINS_FIELD[mode]         || 'winsStandard';
+      const lossesF = LOSSES_FIELD[mode]       || 'lossesStandard';
+      const drawsF  = DRAWS_FIELD[mode]        || 'drawsStandard';
+      const queueReset = { queueStatus: 'offline', queuedAt: null, queuedDraftId: null, queuedMode: null };
 
       await tx.user.update({
         where: { id: player1Id },
-        data: {
-          elo: newP1Elo, gamesPlayed: { increment: 1 },
-          wins:   (!isDraw && winnerId === player1Id) ? { increment: 1 } : undefined,
-          losses: (!isDraw && winnerId !== player1Id) ? { increment: 1 } : undefined,
-          draws:  isDraw                              ? { increment: 1 } : undefined,
+        data:  {
+          [eloF]:   newP1Elo,
+          [gamesF]: { increment: 1 },
+          ...(!isDraw && winnerId === player1Id ? { [winsF]:   { increment: 1 } } : {}),
+          ...(!isDraw && winnerId !== player1Id ? { [lossesF]: { increment: 1 } } : {}),
+          ...(isDraw                            ? { [drawsF]:  { increment: 1 } } : {}),
           ...queueReset,
         },
       });
 
       await tx.user.update({
         where: { id: player2Id },
-        data: {
-          elo: newP2Elo, gamesPlayed: { increment: 1 },
-          wins:   (!isDraw && winnerId === player2Id) ? { increment: 1 } : undefined,
-          losses: (!isDraw && winnerId !== player2Id) ? { increment: 1 } : undefined,
-          draws:  isDraw                              ? { increment: 1 } : undefined,
+        data:  {
+          [eloF]:   newP2Elo,
+          [gamesF]: { increment: 1 },
+          ...(!isDraw && winnerId === player2Id ? { [winsF]:   { increment: 1 } } : {}),
+          ...(!isDraw && winnerId !== player2Id ? { [lossesF]: { increment: 1 } } : {}),
+          ...(isDraw                            ? { [drawsF]:  { increment: 1 } } : {}),
           ...queueReset,
         },
       });
@@ -186,13 +209,21 @@ function maxEloDiff(queuedAtMs) {
 }
 function findBestMatch(target, candidates) {
   if (candidates.length === 0) return null;
+  // Only match players queued for the same mode
+  const sameMode = candidates.filter(p => p.queuedMode === target.queuedMode);
+  if (sameMode.length === 0) {
+    logger.info(`[Match] no opponents in same mode (${target.queuedMode}) for ${target.username}`);
+    return null;
+  }
   const limit  = maxEloDiff(new Date(target.queuedAt).getTime());
-  const sorted = candidates
-    .map(p => ({ ...p, diff: Math.abs(p.elo - target.elo) }))
+  const modeEloField = ELO_FIELD[target.queuedMode] || 'eloStandard';
+  const targetElo    = target[modeEloField] ?? 1200;
+  const sorted = sameMode
+    .map(p => ({ ...p, diff: Math.abs((p[modeEloField] ?? 1200) - targetElo) }))
     .sort((a, b) => a.diff - b.diff);
   const best = sorted[0];
   if (best.diff > limit) {
-    logger.info(`[Match] no suitable opponent for ${target.username} (diff=${best.diff}, limit=${limit})`);
+    logger.info(`[Match] no suitable opponent for ${target.username} (mode=${target.queuedMode}, diff=${best.diff}, limit=${limit})`);
     return null;
   }
   return best;
@@ -230,7 +261,7 @@ const matchWorker = new Worker('match-queue', async (_job) => {
   const queuedPlayers = await prisma.user.findMany({
     where:   { queueStatus: 'queued' },
     orderBy: { queuedAt: 'asc' },
-    select:  { id: true, username: true, queuedDraftId: true, elo: true, queuedAt: true },
+    select:  { id: true, username: true, queuedDraftId: true, queuedMode: true, queuedAt: true, eloStandard: true, eloPauper: true, eloRoyal: true },
   });
 
   if (queuedPlayers.length < 2) return;
@@ -239,7 +270,12 @@ const matchWorker = new Worker('match-queue', async (_job) => {
   const player2 = findBestMatch(player1, queuedPlayers.slice(1));
   if (!player2) return;
 
-  logger.info(`[Match] pairing ${player1.username} (${player1.elo}) vs ${player2.username} (${player2.elo})`);
+  const mode        = player1.queuedMode || 'standard';
+  const modeEloField = ELO_FIELD[mode] || 'eloStandard';
+  const p1Elo        = player1[modeEloField] ?? 1200;
+  const p2Elo        = player2[modeEloField] ?? 1200;
+  const auxPoints    = (MODE_CONFIG[mode] || MODE_CONFIG.standard).auxPoints;
+  logger.info(`[Match] pairing ${player1.username} (${p1Elo}) vs ${player2.username} (${p2Elo}) mode=${mode}`);
 
   const [draft1, draft2] = await Promise.all([
     prisma.draft.findUnique({ where: { id: player1.queuedDraftId }, select: { fen: true } }),
@@ -271,13 +307,14 @@ const matchWorker = new Worker('match-queue', async (_job) => {
       draft2Id:         isPlayer1White ? player2.queuedDraftId : player1.queuedDraftId,
       fen:              gameFen,
       status:           'prep',
+      mode,
       prepStartedAt:    now,
       readyPlayer1:     false,
       readyPlayer2:     false,
-      auxPointsPlayer1: 6,
-      auxPointsPlayer2: 6,
-      player1EloBefore: player1.elo,
-      player2EloBefore: player2.elo,
+      auxPointsPlayer1: auxPoints,
+      auxPointsPlayer2: auxPoints,
+      player1EloBefore: p1Elo,
+      player2EloBefore: p2Elo,
     },
   });
 
@@ -355,12 +392,12 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
   const game = await prisma.game.findUnique({
     where:  { id: gameId },
     select: {
-      id: true, status: true, fen: true,
+      id: true, status: true, fen: true, mode: true,
       player1Id: true, player2Id: true, whitePlayerId: true,
       lastMoveAt: true, player1Timebank: true, player2Timebank: true,
       player1EloBefore: true, player2EloBefore: true,
-      player1: { select: { gamesPlayed: true, username: true } },
-      player2: { select: { gamesPlayed: true, username: true } },
+      player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true, username: true } },
+      player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true, username: true } },
     },
   });
 
@@ -397,12 +434,14 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
 
   const winnerId = isP1Turn ? game.player2Id : game.player1Id;
 
+  const gameMode    = game.mode || 'standard';
+  const gamesField  = GAMES_PLAYED_FIELD[gameMode] || 'gamesPlayedStandard';
   const result = await finalizeGame(
     gameId, winnerId,
     game.player1Id, game.player2Id,
     game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-    game.player1.gamesPlayed, game.player2.gamesPlayed,
-    'timeout'
+    game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
+    'timeout', gameMode
   );
 
   if (!result) {
@@ -435,12 +474,12 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
       lastMoveAt: { lt: staleCutoff },
     },
     select: {
-      id: true, fen: true, lastMoveAt: true,
+      id: true, fen: true, lastMoveAt: true, mode: true,
       player1Id: true, player2Id: true, whitePlayerId: true,
       player1Timebank: true, player2Timebank: true,
       player1EloBefore: true, player2EloBefore: true,
-      player1: { select: { gamesPlayed: true } },
-      player2: { select: { gamesPlayed: true } },
+      player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
+      player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
     },
   });
 
@@ -464,12 +503,14 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
 
       logger.info(`[Reconcile] force-finishing game ${game.id} (winner: ${winnerId})`);
 
+      const rMode      = game.mode || 'standard';
+      const rGamesField = GAMES_PLAYED_FIELD[rMode] || 'gamesPlayedStandard';
       const result = await finalizeGame(
         game.id, winnerId,
         game.player1Id, game.player2Id,
         game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-        game.player1.gamesPlayed, game.player2.gamesPlayed,
-        'timeout'
+        game.player1[rGamesField] ?? 0, game.player2[rGamesField] ?? 0,
+        'timeout', rMode
       );
 
       if (result) {
@@ -589,4 +630,4 @@ async function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-main().catch(err => { logger.error({ err }, '[Matchmaker] fatal'); process.exit(1); });
+main().catch(err => { logger.error('[Matchmaker] fatal:', err); process.exit(1); });

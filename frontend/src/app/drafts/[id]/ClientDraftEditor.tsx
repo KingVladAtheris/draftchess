@@ -1,12 +1,16 @@
 // src/app/drafts/[id]/ClientDraftEditor.tsx
-// ⚠️  All logic (pointsUsed state, placePiece, removePiece, movePiece,
-//     battery checks, FEN helpers) is copied verbatim from the original.
-//     Only className strings have been changed.
+// CHANGES vs original:
+//   - Props extended with `mode: GameMode` and `budget: number`.
+//   - `maxPoints = 33` replaced with `budget` prop throughout.
+//   - Mode badge shown in sidebar (Standard / Pauper / Royal) with correct colour.
+//   - handleSave uses apiFetch() instead of raw fetch() so the CSRF header is sent.
 "use client";
 
 import { useState, useMemo } from "react";
 import { Chessboard } from "react-chessboard";
 import Link from "next/link";
+import { apiFetch } from "@/app/lib/api-fetch";
+import { MODE_CONFIG, type GameMode } from "@/app/lib/game-modes";
 
 type LibraryPiece = {
   name: string;
@@ -16,10 +20,18 @@ type LibraryPiece = {
 };
 
 type ClientDraftEditorProps = {
-  initialFen: string;
+  initialFen:    string;
   initialPoints: number;
-  draftId: number;
-  initialName?: string;
+  draftId:       number;
+  initialName?:  string;
+  mode:          GameMode;   // ← new
+  budget:        number;     // ← new
+};
+
+const MODE_BADGE_CLS: Record<GameMode, string> = {
+  standard: "bg-amber-500/15 text-amber-400 border-amber-500/25",
+  pauper:   "bg-sky-500/15   text-sky-400   border-sky-500/25",
+  royal:    "bg-purple-500/15 text-purple-400 border-purple-500/25",
 };
 
 export default function ClientDraftEditor({
@@ -27,18 +39,22 @@ export default function ClientDraftEditor({
   initialPoints,
   draftId,
   initialName = "",
+  mode,
+  budget,
 }: ClientDraftEditorProps) {
   const [position, setPosition]     = useState(initialFen);
-  const [pointsUsed, setPointsUsed] = useState(initialPoints); // ← plain state, incremented/decremented in place/remove
+  const [pointsUsed, setPointsUsed] = useState(initialPoints);
   const [draftName, setDraftName]   = useState(initialName);
-  const maxPoints = 33;
 
-  const [activePiece, setActivePiece]         = useState<string | null>(null);
-  const [draggedSquare, setDraggedSquare]     = useState<string | null>(null);
-  const [legalSquares, setLegalSquares]       = useState<string[]>([]);
-  const [illegalSquares, setIllegalSquares]   = useState<string[]>([]);
-  const [isDragging, setIsDragging]           = useState(false);
-  const [saveState, setSaveState]             = useState<"idle" | "saving" | "saved" | "error">("idle");
+  // budget prop replaces the old hardcoded 33
+  const maxPoints = budget;
+
+  const [activePiece, setActivePiece]       = useState<string | null>(null);
+  const [draggedSquare, setDraggedSquare]   = useState<string | null>(null);
+  const [legalSquares, setLegalSquares]     = useState<string[]>([]);
+  const [illegalSquares, setIllegalSquares] = useState<string[]>([]);
+  const [isDragging, setIsDragging]         = useState(false);
+  const [saveState, setSaveState]           = useState<"idle" | "saving" | "saved" | "error">("idle");
 
   const pieceLibrary: LibraryPiece[] = useMemo(
     () => [
@@ -140,9 +156,9 @@ export default function ClientDraftEditor({
       for (let f = 0; f < 8; f++) {
         const to = String.fromCharCode(97 + f) + r;
         if (to === from) continue;
-        if (piece === "P" && r !== 2)                                        { illegal.push(to); continue; }
+        if (piece === "P" && r !== 2)                                         { illegal.push(to); continue; }
         if (piece === "K" && (r !== 1 || !["c","d","e","f"].includes(to[0]))){ illegal.push(to); continue; }
-        if (getPieceAt(to) !== "1")                                          { illegal.push(to); continue; }
+        if (getPieceAt(to) !== "1")                                           { illegal.push(to); continue; }
         const tempPos = simulateMove(from, to);
         if (hasIllegalBattery(tempPos)) illegal.push(to); else legal.push(to);
       }
@@ -155,9 +171,9 @@ export default function ClientDraftEditor({
     for (let r = 1; r <= 2; r++) {
       for (let f = 0; f < 8; f++) {
         const sq = String.fromCharCode(97 + f) + r;
-        if (fenLetter === "P" && r !== 2)                                        { illegal.push(sq); continue; }
+        if (fenLetter === "P" && r !== 2)                                         { illegal.push(sq); continue; }
         if (fenLetter === "K" && (r !== 1 || !["c","d","e","f"].includes(sq[0]))){ illegal.push(sq); continue; }
-        if (getPieceAt(sq) !== "1")                                              { illegal.push(sq); continue; }
+        if (getPieceAt(sq) !== "1")                                               { illegal.push(sq); continue; }
         const tempPos = simulatePlacement(fenLetter, sq);
         if (hasIllegalBattery(tempPos)) illegal.push(sq); else legal.push(sq);
       }
@@ -168,12 +184,8 @@ export default function ClientDraftEditor({
   const customSquareStyles = useMemo(() => {
     const styles: Record<string, React.CSSProperties> = {};
     if (isDragging || activePiece) {
-      legalSquares.forEach(sq => {
-        styles[sq] = { backgroundColor: "rgba(0,200,0,0.45)" };  // amber — matches theme
-      });
-      illegalSquares.forEach(sq => {
-        styles[sq] = { backgroundColor: "rgba(220,0,0,0.35)" };  // red
-      });
+      legalSquares.forEach(sq  => { styles[sq] = { backgroundColor: "rgba(0,200,0,0.45)" }; });
+      illegalSquares.forEach(sq => { styles[sq] = { backgroundColor: "rgba(220,0,0,0.35)" }; });
     }
     return styles;
   }, [isDragging, activePiece, legalSquares, illegalSquares]);
@@ -199,7 +211,7 @@ export default function ClientDraftEditor({
     return movePiece(sourceSquare, targetSquare);
   };
 
-  // ─── Piece operations (verbatim) ─────────────────────────────────────────
+  // ─── Piece operations (verbatim) ──────────────────────────────────────────
 
   const placePiece = (fenLetter: string, targetSquare: string, addPoints = true): boolean => {
     const rank = parseInt(targetSquare[1], 10);
@@ -228,7 +240,6 @@ export default function ClientDraftEditor({
     setPosition(newPosition);
     if (addPoints) setPointsUsed(prev => prev + selected.value);
     return true;
-    
   };
 
   const removePiece = (square: string, refund = true): boolean => {
@@ -256,7 +267,7 @@ export default function ClientDraftEditor({
     const rankTo = parseInt(to[1], 10);
     if (rankTo !== 1 && rankTo !== 2) { alert("Pieces can only be moved to ranks 1 or 2"); return false; }
     const rankFrom = parseInt(from[1], 10); const fileFrom = from.charCodeAt(0) - 97;
-    const fileTo   = to.charCodeAt(0)   - 97;
+    const fileTo   = to.charCodeAt(0) - 97;
     const fenParts = position.split(" ");
     const rows = fenParts[0].split("/");
     const rankIndexFrom = 8 - rankFrom; const rankIndexTo = 8 - rankTo;
@@ -265,7 +276,7 @@ export default function ClientDraftEditor({
     if (piece === "1") return false;
     if (piece === "P" && rankTo !== 2) { alert("Pawns can only be on rank 2"); return false; }
     if (piece === "K") {
-      if (rankTo !== 1 || !["e",].includes(to[0])) {
+      if (rankTo !== 1 || !["e"].includes(to[0])) {
         alert("King can only be placed on rank 1, file e"); return false;
       }
     }
@@ -281,7 +292,7 @@ export default function ClientDraftEditor({
     return true;
   };
 
-  // ─── Save ─────────────────────────────────────────────────────────────────
+  // ─── Save — uses apiFetch so CSRF header is included automatically ─────────
 
   const handleSave = async () => {
     let finalName = draftName;
@@ -296,10 +307,9 @@ export default function ClientDraftEditor({
     }
     setSaveState("saving");
     try {
-      const res = await fetch(`/api/drafts/${draftId}`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ fen: position, points: pointsUsed, name: finalName }),
+      const res = await apiFetch(`/api/drafts/${draftId}`, {
+        method: "POST",
+        body:   JSON.stringify({ fen: position, points: pointsUsed, name: finalName }),
       });
       if (!res.ok) throw new Error("Save failed");
       setSaveState("saved");
@@ -315,6 +325,7 @@ export default function ClientDraftEditor({
 
   const remaining = maxPoints - pointsUsed;
   const pct       = Math.min(100, (pointsUsed / maxPoints) * 100);
+  const modeCfg   = MODE_CONFIG[mode];
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
@@ -330,6 +341,11 @@ export default function ClientDraftEditor({
         >
           ← My Drafts
         </Link>
+
+        {/* Mode badge */}
+        <span className={`inline-flex items-center self-start px-2.5 py-1 rounded-lg text-[11px] font-bold border ${MODE_BADGE_CLS[mode]}`}>
+          {modeCfg.label} · {modeCfg.draftBudget}pts
+        </span>
 
         {/* Draft name */}
         <div>
@@ -426,9 +442,9 @@ export default function ClientDraftEditor({
           disabled={saveState === "saving"}
           className="btn-primary w-full py-3"
         >
-          {saveState === "saving" ? "Saving…"      :
-           saveState === "saved"  ? "✓ Saved"      :
-           saveState === "error"  ? "Save failed"  :
+          {saveState === "saving" ? "Saving…"     :
+           saveState === "saved"  ? "✓ Saved"     :
+           saveState === "error"  ? "Save failed" :
            "Save Draft"}
         </button>
 
@@ -469,7 +485,7 @@ export default function ClientDraftEditor({
         <p className="mt-4 text-white/25 text-xs text-center max-w-md leading-relaxed">
           Pawns must stay on rank 2. King locked on e1. Batteries are illegal.
         </p>
-        <p className="mt-4 text-white/25 text-xs text-center max-w-md leading-relaxed">
+        <p className="mt-2 text-white/25 text-xs text-center max-w-md leading-relaxed">
           Drag to reposition. Click occupied square or right-click to remove.
         </p>
       </div>

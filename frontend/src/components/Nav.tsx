@@ -336,21 +336,36 @@ function UserDropdown() {
   );
 }
 
+// ─── Presence ────────────────────────────────────────────────────────────────
+// Connects the socket as soon as the user is authenticated so that
+// online:{userId} is set in Redis (and the heartbeat keeps it alive) regardless
+// of which page the user is on — not just on the play/game pages.
+function usePresence(isLoggedIn: boolean) {
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    import("@/app/lib/socket").then(({ getSocket }) => {
+      getSocket().catch(() => {}); // connect — heartbeat starts on the 'connect' event
+    });
+  }, [isLoggedIn]);
+}
+
 // ─── Nav ─────────────────────────────────────────────────────────────────────
 export default function Nav() {
   const { status } = useSession();
   const isLoggedIn = status === "authenticated";
 
+  usePresence(isLoggedIn);
+
   const playItems: DropdownItem[] = [
-    { type: "link", label: "Standard", href: "/play/select" },
-    { type: "link", label: "Pauper",   href: "/play/select?mode=pauper", soon: true },
-    { type: "link", label: "Royal",    href: "/play/select?mode=royal",  soon: true },
+    { type: "link", label: "Standard", href: "/play/standard" },
+    { type: "link", label: "Pauper",   href: "/play/pauper"   },
+    { type: "link", label: "Royal",    href: "/play/royal"    },
   ];
 
   const draftItems: DropdownItem[] = [
-    { type: "link", label: "Standard drafts", href: "/drafts" },
-    { type: "link", label: "Pauper drafts",   href: "/drafts?mode=pauper", soon: true },
-    { type: "link", label: "Royal drafts",    href: "/drafts?mode=royal",  soon: true },
+    { type: "link", label: "Standard drafts", href: "/drafts#standard" },
+    { type: "link", label: "Pauper drafts",   href: "/drafts#pauper"   },
+    { type: "link", label: "Royal drafts",    href: "/drafts#royal"    },
   ];
 
   return (

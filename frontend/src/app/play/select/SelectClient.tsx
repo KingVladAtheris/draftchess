@@ -1,12 +1,14 @@
 // src/app/play/select/SelectClient.tsx
-// CHANGE: raw fetch() replaced with apiFetch() on all POST routes
-//         so the CSRF header is sent automatically.
-//         GET to /api/queue/status keeps plain fetch (read-only, no CSRF needed).
+// CHANGES:
+//   - Accepts `mode` and `budget` props so it works for all three game modes.
+//   - DraftOption and QueuePanel display the correct per-mode point budget.
+//   - Mode colour accent (amber=standard, sky=pauper, purple=royal).
 "use client";
 
 import { useState, useEffect, useRef } from "react";
 import { getSocket } from "@/app/lib/socket";
 import { apiFetch } from "@/app/lib/api-fetch";
+import type { GameMode } from "@/app/lib/game-modes";
 
 type Draft = { id: number; name: string | null; points: number; updatedAt: Date; };
 
@@ -18,41 +20,53 @@ function timeAgo(date: Date) {
   return new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function DraftOption({ draft, selected, disabled, onSelect }: {
+const ACCENT = {
+  standard: { bar: "bg-amber-400",  barMuted: "bg-white/25", selectedBorder: "border-amber-500/50 bg-amber-500/8",  checkBg: "bg-amber-400",  iconBg: "bg-amber-500/15 border-amber-500/25",  iconText: "text-amber-400",  queueBox: "bg-amber-500/8 border-amber-500/20",  queueText: "text-amber-400",  queueSub: "text-amber-400/50",  dots: "bg-amber-400"   },
+  pauper:   { bar: "bg-sky-400",    barMuted: "bg-white/25", selectedBorder: "border-sky-500/50 bg-sky-500/8",      checkBg: "bg-sky-400",    iconBg: "bg-sky-500/15 border-sky-500/25",      iconText: "text-sky-400",    queueBox: "bg-sky-500/8 border-sky-500/20",      queueText: "text-sky-400",    queueSub: "text-sky-400/50",    dots: "bg-sky-400"     },
+  royal:    { bar: "bg-purple-400", barMuted: "bg-white/25", selectedBorder: "border-purple-500/50 bg-purple-500/8",checkBg: "bg-purple-400", iconBg: "bg-purple-500/15 border-purple-500/25", iconText: "text-purple-400", queueBox: "bg-purple-500/8 border-purple-500/20", queueText: "text-purple-400", queueSub: "text-purple-400/50", dots: "bg-purple-400"  },
+} as const;
+
+function DraftOption({ draft, selected, disabled, onSelect, budget, mode }: {
   draft: Draft; selected: boolean; disabled: boolean; onSelect: () => void;
+  budget: number; mode: GameMode;
 }) {
-  const pct = Math.min(100, (draft.points / 33) * 100);
+  const pct = Math.min(100, (draft.points / budget) * 100);
+  const a   = ACCENT[mode];
   return (
     <button
       onClick={onSelect}
       disabled={disabled}
       className={`w-full text-left p-4 rounded-xl border transition-all duration-200
         ${disabled ? "opacity-60 cursor-not-allowed" :
-          selected ? "border-amber-500/50 bg-amber-500/8 cursor-pointer" :
+          selected ? `${a.selectedBorder} cursor-pointer` :
           "border-white/8 bg-white/[0.02] hover:border-white/18 hover:bg-white/[0.05] cursor-pointer"}`}
     >
       <div className="flex items-center justify-between gap-2 mb-2">
-        <span className={`font-display font-600 text-sm truncate ${selected ? "text-amber-400" : "text-white/80"}`}>
+        <span className={`font-display font-600 text-sm truncate ${selected ? a.iconText : "text-white/80"}`}>
           {draft.name || `Draft #${draft.id}`}
         </span>
         <div className="flex items-center gap-2 flex-shrink-0">
-          {selected && <span className="w-4 h-4 rounded-full bg-amber-400 flex items-center justify-center text-[9px] text-[#0f1117] font-bold">✓</span>}
+          {selected && (
+            <span className={`w-4 h-4 rounded-full ${a.checkBg} text-[#0f1117] flex items-center justify-center text-[9px] font-bold`}>✓</span>
+          )}
           <span className="text-xs text-white/30">{timeAgo(draft.updatedAt)}</span>
         </div>
       </div>
       <div className="h-0.5 rounded-full bg-white/8 overflow-hidden mb-2">
-        <div className={`h-full rounded-full ${selected ? "bg-amber-400" : "bg-white/25"}`} style={{ width: `${pct}%` }} />
+        <div className={`h-full rounded-full ${selected ? a.bar : a.barMuted}`} style={{ width: `${pct}%` }} />
       </div>
-      <span className="text-xs text-white/35">{draft.points}/33 pts</span>
+      <span className="text-xs text-white/35">{draft.points}/{budget} pts</span>
     </button>
   );
 }
 
-function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave }: {
+function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave, budget, mode }: {
   selectedDraft: Draft | null; isQueuing: boolean; onQueue: () => void; onLeave: () => void;
+  budget: number; mode: GameMode;
 }) {
   const [elapsed, setElapsed] = useState(0);
   const startRef = useRef<number | null>(null);
+  const a = ACCENT[mode];
 
   useEffect(() => {
     if (!isQueuing) { setElapsed(0); startRef.current = null; return; }
@@ -69,10 +83,10 @@ function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave }: {
         <p className="text-xs font-semibold uppercase tracking-wider text-white/35 mb-3">Playing with</p>
         {selectedDraft ? (
           <div className="flex items-center gap-3 p-3 rounded-xl bg-white/[0.04] border border-white/8">
-            <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-amber-400 text-xl flex-shrink-0">♟</div>
+            <div className={`w-9 h-9 rounded-lg ${a.iconBg} border flex items-center justify-center ${a.iconText} text-xl flex-shrink-0`}>♟</div>
             <div className="min-w-0">
               <p className="text-sm font-600 font-display text-white truncate">{selectedDraft.name || `Draft #${selectedDraft.id}`}</p>
-              <p className="text-xs text-white/35">{selectedDraft.points}/33 pts</p>
+              <p className="text-xs text-white/35">{selectedDraft.points}/{budget} pts</p>
             </div>
           </div>
         ) : (
@@ -84,15 +98,15 @@ function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave }: {
       </div>
 
       {isQueuing && (
-        <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-amber-500/8 border border-amber-500/20">
+        <div className={`flex items-center gap-3 px-4 py-3 rounded-xl ${a.queueBox} border`}>
           <div className="flex gap-0.5 items-end h-4">
             {[0,1,2].map(i => (
-              <div key={i} className="w-1 rounded-full bg-amber-400 animate-bounce" style={{ height: "100%", animationDelay: `${i*0.15}s` }} />
+              <div key={i} className={`w-1 rounded-full ${a.dots} animate-bounce`} style={{ height: "100%", animationDelay: `${i*0.15}s` }} />
             ))}
           </div>
           <div>
-            <p className="text-xs font-semibold text-amber-400">Searching for opponent</p>
-            <p className="text-xs text-amber-400/50 tabular-nums">{fmt(elapsed)}</p>
+            <p className={`text-xs font-semibold ${a.queueText}`}>Searching for opponent</p>
+            <p className={`text-xs ${a.queueSub} tabular-nums`}>{fmt(elapsed)}</p>
           </div>
         </div>
       )}
@@ -112,7 +126,11 @@ function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave }: {
   );
 }
 
-export default function SelectClient({ drafts }: { drafts: Draft[] }) {
+export default function SelectClient({ drafts, mode, budget }: {
+  drafts: Draft[];
+  mode:   GameMode;
+  budget: number;
+}) {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [isQueuing, setIsQueuing]   = useState(false);
   const [error, setError]           = useState<string | null>(null);
@@ -123,7 +141,6 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
 
   useEffect(() => {
     let mounted = true;
-    // GET — no CSRF needed, plain fetch is fine
     fetch("/api/queue/status")
       .then(r => r.ok ? r.json() : null)
       .then(data => {
@@ -138,8 +155,6 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
   useEffect(() => {
     return () => {
       if (isQueuingRef.current && !didLeaveRef.current) {
-        // keepalive POST on unmount — apiFetch doesn't support keepalive,
-        // so we call fetch directly but manually add the CSRF header.
         fetch("/api/queue/leave", {
           method:    "POST",
           keepalive: true,
@@ -182,11 +197,18 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
     getSocket().then(s => { s.emit("leave-queue"); s.off("matched"); s.off("queue-error"); }).catch(() => {});
   };
 
+  const modeLabel = mode === "standard" ? "Standard" : mode === "pauper" ? "Pauper" : "Royal";
+  const modeDesc  = mode === "standard"
+    ? "33pt army · 6 aux points — the classic format."
+    : mode === "pauper"
+    ? "18pt army · 3 aux points — lean and tactical."
+    : "48pt army · 12 aux points — the full arsenal.";
+
   return (
     <div className="max-w-5xl mx-auto px-4 md:px-8 py-10">
       <div className="mb-8">
-        <h1 className="font-display text-3xl font-800 text-white">Find a match</h1>
-        <p className="text-white/45 text-sm mt-1">Choose a draft, then search for an opponent.</p>
+        <h1 className="font-display text-3xl font-800 text-white">{modeLabel} — Find a match</h1>
+        <p className="text-white/45 text-sm mt-1">{modeDesc}</p>
       </div>
 
       {error && (
@@ -195,23 +217,39 @@ export default function SelectClient({ drafts }: { drafts: Draft[] }) {
 
       <div className="flex flex-col lg:flex-row gap-6 items-start">
         <div className={`flex-1 min-w-0 transition-opacity duration-200 ${isQueuing ? "opacity-50 pointer-events-none" : ""}`}>
-          <p className="text-xs font-semibold uppercase tracking-wider text-white/35 mb-3">Your drafts</p>
+          <p className="text-xs font-semibold uppercase tracking-wider text-white/35 mb-3">Your {modeLabel} drafts</p>
           {drafts.length === 0 ? (
             <div className="flex flex-col items-center py-16 text-center rounded-2xl border border-dashed border-white/10">
-              <p className="text-white/40 text-sm mb-4">No drafts yet.</p>
-              <a href="/drafts" className="btn-secondary py-2 px-5 text-sm">Create a draft</a>
+              <p className="text-white/40 text-sm mb-2">No {modeLabel} drafts yet.</p>
+              <p className="text-white/25 text-xs mb-6">Create one from the Drafts page to play this mode.</p>
+              <a href="/drafts" className="btn-secondary py-2 px-5 text-sm">Go to Drafts</a>
             </div>
           ) : (
             <div className="grid gap-2 sm:grid-cols-2">
               {drafts.map(draft => (
-                <DraftOption key={draft.id} draft={draft} selected={selectedId === draft.id} disabled={isQueuing} onSelect={() => setSelectedId(draft.id)} />
+                <DraftOption
+                  key={draft.id}
+                  draft={draft}
+                  selected={selectedId === draft.id}
+                  disabled={isQueuing}
+                  onSelect={() => setSelectedId(draft.id)}
+                  budget={budget}
+                  mode={mode}
+                />
               ))}
             </div>
           )}
         </div>
 
         <div className="w-full lg:w-72 flex-shrink-0 lg:sticky lg:top-20">
-          <QueuePanel selectedDraft={drafts.find(d => d.id === selectedId) ?? null} isQueuing={isQueuing} onQueue={handleQueue} onLeave={handleLeave} />
+          <QueuePanel
+            selectedDraft={drafts.find(d => d.id === selectedId) ?? null}
+            isQueuing={isQueuing}
+            onQueue={handleQueue}
+            onLeave={handleLeave}
+            budget={budget}
+            mode={mode}
+          />
         </div>
       </div>
     </div>

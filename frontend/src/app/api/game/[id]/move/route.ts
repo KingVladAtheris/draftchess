@@ -9,6 +9,7 @@ import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma.server";
 import { Chess } from "chess.js";
 import { updateGameResult } from "@/app/lib/elo-update";
+import { type GameMode, GAMES_PLAYED_FIELD } from "@/app/lib/game-modes";
 import { scheduleTimeoutJob, cancelTimeoutJob } from "@/app/lib/queues";
 import { consume, moveLimiter } from "@/app/lib/rate-limit";
 import { checkCsrf } from "@/app/lib/csrf";
@@ -69,14 +70,15 @@ export async function POST(
       player1Id: true,
       player2Id: true,
       whitePlayerId: true,
+      mode: true,
       player1EloBefore: true,
       player2EloBefore: true,
       lastMoveAt: true,
       moveNumber: true,
       player1Timebank: true,
       player2Timebank: true,
-      player1: { select: { gamesPlayed: true } },
-      player2: { select: { gamesPlayed: true } },
+      player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
+      player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
     },
   });
 
@@ -113,12 +115,14 @@ export async function POST(
   if (overage > 0 && currentTimebank - overage <= 0) {
     const winnerId = isPlayer1 ? game.player2Id : game.player1Id;
 
+    const gameMode   = (game.mode ?? "standard") as GameMode;
+    const gamesField = GAMES_PLAYED_FIELD[gameMode];
     const result = await updateGameResult(
       gameId, winnerId,
       game.player1Id, game.player2Id,
       game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-      game.player1.gamesPlayed, game.player2.gamesPlayed,
-      "timeout"
+      game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
+      "timeout", gameMode
     );
 
     if (result) {
@@ -202,12 +206,14 @@ export async function POST(
   // only when one of the chess.is*() checks above set it to a string.
   let eloResult: { newPlayer1Elo: number; newPlayer2Elo: number; eloChange: number } | null = null;
   if (newStatus === "finished" && endReason !== null) {
+    const gameMode2   = (game.mode ?? "standard") as GameMode;
+    const gamesField2 = GAMES_PLAYED_FIELD[gameMode2];
     eloResult = await updateGameResult(
       gameId, winnerId,
       game.player1Id, game.player2Id,
       game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-      game.player1.gamesPlayed, game.player2.gamesPlayed,
-      endReason
+      game.player1[gamesField2] ?? 0, game.player2[gamesField2] ?? 0,
+      endReason, gameMode2
     );
   }
 

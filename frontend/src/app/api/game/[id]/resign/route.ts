@@ -6,6 +6,7 @@ import { prisma } from "@/app/lib/prisma.server";
 import { checkCsrf } from "@/app/lib/csrf";
 import { cancelTimeoutJob } from "@/app/lib/queues";
 import { updateGameResult } from "@/app/lib/elo-update";
+import { type GameMode, GAMES_PLAYED_FIELD } from "@/app/lib/game-modes";
 import { publishGameUpdate } from "@/app/lib/redis-publisher";
 
 export async function POST(
@@ -29,9 +30,10 @@ export async function POST(
     select: {
       id: true, status: true,
       player1Id: true, player2Id: true,
+      mode: true,
       player1EloBefore: true, player2EloBefore: true,
-      player1: { select: { gamesPlayed: true } },
-      player2: { select: { gamesPlayed: true } },
+      player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
+      player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
     },
   });
 
@@ -49,12 +51,14 @@ export async function POST(
 
   await cancelTimeoutJob(gameId);
 
+  const gameMode   = (game.mode ?? "standard") as GameMode;
+  const gamesField = GAMES_PLAYED_FIELD[gameMode];
   const result = await updateGameResult(
     gameId, winnerId,
     game.player1Id, game.player2Id,
     game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-    game.player1.gamesPlayed, game.player2.gamesPlayed,
-    "resignation"
+    game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
+    "resignation", gameMode
   );
 
   if (result) {
