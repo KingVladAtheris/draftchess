@@ -17,6 +17,7 @@ import { Chess, type Square } from "chess.js";
 import { getSocket } from "@/app/lib/socket";
 import { useToast } from "@/components/ToastProvider";
 import { apiFetch } from "@/app/lib/api-fetch";
+import { modeAuxPoints, type GameMode } from "@/app/lib/game-modes";
 
 class DraftChess extends Chess {
   constructor(fen?: string) { super(fen ?? "start"); }
@@ -53,6 +54,7 @@ type ClientGameProps = {
   initialAuxPointsPlayer2: number;
   player1Id: number;
   player2Id: number;
+  mode: GameMode;
 };
 
 const MOVE_TIME_LIMIT = 30000;
@@ -81,7 +83,7 @@ function getTimerBarClass(ms: number): string {
 export default function ClientGame({
   gameId, myUserId, initialFen, isWhite, initialStatus,
   initialPrepStartedAt, initialReadyPlayer1, initialReadyPlayer2,
-  initialAuxPointsPlayer1, initialAuxPointsPlayer2, player1Id, player2Id,
+  initialAuxPointsPlayer1, initialAuxPointsPlayer2, player1Id, player2Id, mode,
 }: ClientGameProps) {
 
   const toast = useToast();
@@ -129,6 +131,7 @@ export default function ClientGame({
   const auxPoints   = isPlayer1 ? auxPointsPlayer1 : auxPointsPlayer2;
   const myTimebank  = isPlayer1 ? player1Timebank : player2Timebank;
   const oppTimebank = isPlayer1 ? player2Timebank : player1Timebank;
+  const auxPointsMax = modeAuxPoints(mode);
 
   const isMyTurn = useMemo(() => {
     if (status !== "active") return false;
@@ -517,13 +520,13 @@ export default function ClientGame({
                 <span className="text-xs text-white/35 uppercase tracking-wider">Points</span>
                 <span className="font-display text-2xl font-700 tabular-nums text-white">
                   {auxPoints}
-                  <span className="text-xs font-400 text-white/30 ml-1">/ 6</span>
+                  <span className="text-xs font-400 text-white/30 ml-1">/ {auxPointsMax}</span>
                 </span>
               </div>
               <div className="h-1 rounded-full bg-white/8 overflow-hidden">
                 <div
                   className="h-full rounded-full bg-amber-400/70 transition-all duration-300"
-                  style={{ width: `${(auxPoints / 6) * 100}%` }}
+                  style={{ width: `${(auxPoints / auxPointsMax) * 100}%` }}
                 />
               </div>
             </div>

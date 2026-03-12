@@ -40,16 +40,22 @@ export function buildCombinedDraftFen(draft1Fen: string, draft2Fen: string): str
   const w = draft1Fen.split(" ")[0].split("/");
   const b = draft2Fen.split(" ")[0].split("/");
 
-  // Black's pieces: take white's layout from their draft and flip to lowercase
-  const blackBack  = expandFenRow(b[7]).split("").map(c => /[a-zA-Z]/.test(c) ? c.toLowerCase() : c).join("");
-  const blackFront = expandFenRow(b[6]).split("").map(c => /[a-zA-Z]/.test(c) ? c.toLowerCase() : c).join("");
+  // Helper: expand → lowercase → mirror files → compress
+  const blackRow = (fenRow: string): string => {
+    const expanded = expandFenRow(fenRow)
+      .split("")
+      .map(c => /[a-zA-Z]/.test(c) ? c.toLowerCase() : c)
+      .reverse()   // ← mirror files a↔h
+      .join("");
+    return compressFenRow(expanded);
+  };
 
   const rows = [
-    compressFenRow(blackBack),   // rank 8
-    compressFenRow(blackFront),  // rank 7
-    "8", "8", "8", "8",         // ranks 6-3
-    w[6],                        // rank 2 (white front)
-    w[7],                        // rank 1 (white back)
+    blackRow(b[7]),   // rank 8 — black's back rank (was rank 1 in their draft)
+    blackRow(b[6]),   // rank 7 — black's front rank (was rank 2 in their draft)
+    "8", "8", "8", "8",
+    w[6],             // rank 2 — white's front rank
+    w[7],             // rank 1 — white's back rank
   ];
 
   return rows.join("/") + " w - - 0 1";

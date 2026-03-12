@@ -216,17 +216,44 @@ async function finalizeGame(gameId, winnerId, player1Id, player2Id,
 }
 
 // ─── FEN helpers ───────────────────────────────────────────────────────────
-function lowercaseRow(row) {
-  return row.split('').map(c => isNaN(parseInt(c)) ? c.toLowerCase() : c).join('');
+function expandRow(row) {
+  let result = "";
+  for (const c of row) {
+    result += /\d/.test(c) ? "1".repeat(parseInt(c, 10)) : c;
+  }
+  return result;
 }
+
+function compressRow(row) {
+  let result = "", count = 0;
+  for (const c of row) {
+    if (c === "1") { count++; }
+    else { if (count) { result += count; count = 0; } result += c; }
+  }
+  if (count) result += count;
+  return result;
+}
+
+function blackRow(fenRow) {
+  return compressRow(
+    expandRow(fenRow)
+      .split("")
+      .map(c => isNaN(parseInt(c)) ? c.toLowerCase() : c)
+      .reverse()   // mirror files a↔h
+      .join("")
+  );
+}
+
 function combineFens(whiteFen, blackFen) {
-  const w = whiteFen.split(' ')[0].split('/');
-  const b = blackFen.split(' ')[0].split('/');
+  const w = whiteFen.split(" ")[0].split("/");
+  const b = blackFen.split(" ")[0].split("/");
   return [
-    lowercaseRow(b[7]), lowercaseRow(b[6]),
-    '8', '8', '8', '8',
-    w[6], w[7],
-  ].join('/') + ' w - - 0 1';
+    blackRow(b[7]),   // rank 8
+    blackRow(b[6]),   // rank 7
+    "8", "8", "8", "8",
+    w[6],             // rank 2
+    w[7],             // rank 1
+  ].join("/") + " w - - 0 1";
 }
 
 // ─── ELO pairing ───────────────────────────────────────────────────────────

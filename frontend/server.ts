@@ -65,6 +65,29 @@ app.prepare().then(async () => {
   ]);
   logger.info('[Redis] all clients connected');
 
+  try {
+    const config = await cmdClient.configGet("notify-keyspace-events");
+    const flags  = (config["notify-keyspace-events"] ?? "").toUpperCase();
+    // Need at minimum: E (keyevent) + x (expired)
+    if (!flags.includes("E") || !flags.includes("X")) {
+      logger.fatal(
+        { flags },
+        "[Server] Redis notify-keyspace-events must include 'E' and 'x' (expired keyevent). " +
+        "Add --notify-keyspace-events KExg to your Redis config. Exiting."
+      );
+      process.exit(1);
+    }
+    logger.info({ flags }, "[Server] Redis keyspace notifications OK");
+  } catch (err) {
+    // CONFIG GET may be disabled on managed Redis (e.g. ElastiCache).
+    // Log a warning but don't exit — the operator is responsible for config.
+    logger.warn(
+      { err },
+      "[Server] Could not verify Redis keyspace notifications (CONFIG GET failed). " +
+      "Ensure notify-keyspace-events includes 'Ex' on your Redis instance."
+    );
+  }
+
   const httpServer = createServer(async (req, res) => {
     const parsedUrl = parse(req.url!, true);
     handle(req, res, parsedUrl);
@@ -413,7 +436,7 @@ app.prepare().then(async () => {
     }
 
     logger.info({ userId, gameId }, '[Presence] grace period expired, forfeiting');
-    await forfeitGame(gameId, userId, emitToGame);
+    await forfeitGame(gameId, userId);
   });
   logger.info({ channel: keyspaceChannel }, '[Presence] subscribed to keyspace');
 

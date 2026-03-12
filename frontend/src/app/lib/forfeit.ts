@@ -1,33 +1,46 @@
 // src/app/lib/forfeit.ts
-// Handles game forfeit due to disconnect timeout.
-//
-// NOTE on race safety (#2):
-// The prep→active promotion here (updateMany prep→active) races with the
-// ready route. Both use updateMany guards, so only one can win. After
-// promotion, we call updateGameResult which is now fully transactional —
-// if the ready route also triggered updateGameResult, the second caller's
-// transaction sees status='finished' and returns null cleanly.
+// FIXES:
+//   - Selects per-mode gamesPlayed fields instead of deleted flat gamesPlayed.
+//   - Passes game.mode and game.isFriendGame to updateGameResult.
+//   - cancelTimeoutJob is now always called, not only on the result !== null path.
+//   - emitToGame replaced with publishGameUpdate for consistency with every
+//     other broadcast site. The callback parameter is removed entirely.
 
 import { prisma } from "@/app/lib/prisma.server";
 import { updateGameResult } from "@/app/lib/elo-update";
 import { cancelTimeoutJob } from "@/app/lib/queues";
+import { publishGameUpdate } from "@/app/lib/redis-publisher";
+import { type GameMode, GAMES_PLAYED_FIELD } from "@/app/lib/game-modes";
 
 export async function forfeitGame(
-  gameId:     number,
-  userId:     number,
-  emitToGame: (gameId: number, event: string, payload: any) => void
+  gameId:  number,
+  userId:  number,
 ): Promise<void> {
 
   const game = await prisma.game.findUnique({
     where:  { id: gameId },
     select: {
       status:           true,
+      mode:             true,
+      isFriendGame:     true,
       player1Id:        true,
       player2Id:        true,
       player1EloBefore: true,
       player2EloBefore: true,
-      player1:          { select: { gamesPlayed: true } },
-      player2:          { select: { gamesPlayed: true } },
+      player1: {
+        select: {
+          gamesPlayedStandard: true,
+          gamesPlayedPauper:   true,
+          gamesPlayedRoyal:    true,
+        },
+      },
+      player2: {
+        select: {
+          gamesPlayedStandard: true,
+          gamesPlayedPauper:   true,
+          gamesPlayedRoyal:    true,
+        },
+      },
     },
   });
 
@@ -60,7 +73,13 @@ export async function forfeitGame(
     }
   }
 
-  const winnerId = isPlayer1 ? game.player2Id : game.player1Id;
+  const winnerId   = isPlayer1 ? game.player2Id : game.player1Id;
+  const gameMode   = (game.mode ?? "standard") as GameMode;
+  const gamesField = GAMES_PLAYED_FIELD[gameMode];
+
+  // cancelTimeoutJob is idempotent — call it unconditionally so we never
+  // leave an orphaned timeout job regardless of what updateGameResult returns.
+  await cancelTimeoutJob(gameId);
 
   const result = await updateGameResult(
     gameId,
@@ -69,23 +88,21 @@ export async function forfeitGame(
     game.player2Id,
     game.player1EloBefore ?? 1200,
     game.player2EloBefore ?? 1200,
-    game.player1.gamesPlayed,
-    game.player2.gamesPlayed,
-    "abandoned"
+    game.player1[gamesField] ?? 0,
+    game.player2[gamesField] ?? 0,
+    "abandoned",
+    gameMode,
+    game.isFriendGame === true,
   );
 
   if (!result) {
-    // updateGameResult's transaction saw status != 'active' — another path
-    // (timeout, move) already finished the game. queueStatus was reset there.
+    // updateGameResult saw status != 'active' — another path already finished
+    // the game. Queue state was reset there. Nothing left to do.
     console.log(`[Forfeit] game ${gameId} already finished by another path, skipping`);
     return;
   }
 
-  // updateGameResult already reset queueStatus for both players (#3).
-  // cancelTimeoutJob is idempotent — safe to call even if already cancelled.
-  await cancelTimeoutJob(gameId);
-
-  emitToGame(gameId, "game-update", {
+  await publishGameUpdate(gameId, {
     status:          "finished",
     winnerId,
     endReason:       "abandoned",

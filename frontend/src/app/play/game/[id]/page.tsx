@@ -69,6 +69,7 @@ export default async function GamePage({ params }: GamePageProps) {
       initialAuxPointsPlayer2={game.auxPointsPlayer2}
       player1Id={game.player1Id}
       player2Id={game.player2Id}
+      mode={game.mode ?? "standard"}
     />
   );
 }
