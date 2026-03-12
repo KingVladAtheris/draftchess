@@ -1,9 +1,10 @@
 "use client";
 // src/app/profile/[username]/ProfileClient.tsx
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { apiFetch } from "@/app/lib/api-fetch";
+import { MODE_CONFIG } from "@/app/lib/game-modes";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 type GameMode = "standard" | "pauper" | "royal";
@@ -541,6 +542,101 @@ function TokensTab({ tokens }: { tokens: Token[] }) {
   );
 }
 
+// ─── ChallengeDropdown ──────────────────────────────────────────────────────
+function ChallengeDropdown({
+  profileId, challengeMode, challengeDraftId, challengeDrafts,
+  challengeLoading, challengeSent,
+  onOpen, onModeChange, onDraftChange, onSend,
+}: {
+  profileId: number;
+  challengeMode: GameMode;
+  challengeDraftId: number | null;
+  challengeDrafts: { id: number; name: string | null }[];
+  challengeLoading: boolean;
+  challengeSent: boolean;
+  onOpen: (mode: GameMode) => void;
+  onModeChange: (mode: GameMode) => void;
+  onDraftChange: (id: number | null) => void;
+  onSend: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const handleToggle = () => {
+    if (!open) onOpen(challengeMode); // fetch drafts for current mode on first open
+    setOpen(o => !o);
+  };
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={handleToggle}
+        className="px-4 py-2 rounded-xl text-sm font-semibold border border-purple-500/40 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 transition-all"
+      >
+        ⚔ Challenge
+      </button>
+      {open && (
+        <div className="absolute right-0 top-[calc(100%+8px)] w-72 z-50 bg-[#1a1d2e] border border-white/10 rounded-xl shadow-2xl shadow-black/60 p-4 flex flex-col gap-3">
+          <p className="text-xs font-bold uppercase tracking-wider text-white/40">Send Challenge</p>
+          <p className="text-[11px] text-white/25">Casual game · no ELO impact</p>
+          {/* Mode picker */}
+          <div className="flex gap-1.5">
+            {(["standard", "pauper", "royal"] as GameMode[]).map(m => (
+              <button
+                key={m}
+                onClick={() => onModeChange(m)}
+                className={`flex-1 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                  challengeMode === m
+                    ? m === "royal"  ? "bg-purple-500/20 border-purple-500/40 text-purple-400"
+                    : m === "pauper" ? "bg-sky-500/20 border-sky-500/40 text-sky-400"
+                    :                  "bg-amber-500/20 border-amber-500/40 text-amber-400"
+                    : "border-white/10 text-white/40 hover:border-white/20"
+                }`}
+              >
+                {MODE_CONFIG[m].label}
+              </button>
+            ))}
+          </div>
+          {/* Draft picker */}
+          <div>
+            <p className="text-[10px] text-white/35 mb-1.5">Your draft (optional)</p>
+            <select
+              value={challengeDraftId ?? ""}
+              onChange={e => onDraftChange(e.target.value ? parseInt(e.target.value) : null)}
+              className="w-full bg-[#0f1117] border border-white/10 rounded-lg px-3 py-2 text-sm text-white/70 focus:outline-none focus:border-white/25"
+            >
+              <option value="">— No draft selected —</option>
+              {challengeDrafts.map(d => (
+                <option key={d.id} value={d.id}>{d.name || `Draft #${d.id}`}</option>
+              ))}
+            </select>
+          </div>
+          {challengeSent ? (
+            <p className="text-center text-emerald-400 text-sm font-semibold">✓ Challenge sent!</p>
+          ) : (
+            <button
+              onClick={onSend}
+              disabled={challengeLoading}
+              className="w-full py-2 rounded-xl bg-purple-500/15 border border-purple-500/30 text-purple-400 text-sm font-semibold hover:bg-purple-500/25 transition-all disabled:opacity-50"
+            >
+              {challengeLoading ? "Sending…" : "Send Challenge"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Component ────────────────────────────────────────────────────────
 type Tab = "overview" | "games" | "stats" | "friends" | "following" | "tokens";
 
@@ -551,6 +647,13 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
   const [friendStatus, setFriendStatus]     = useState<FriendStatus>(initialFriendStatus);
   const [friendRequestId, setFriendRequestId] = useState<number | null>(initialRequestId);
   const [friendLoading, setFriendLoading]   = useState(false);
+
+  // ── Challenge state ────────────────────────────────────────────────────────
+  const [challengeMode, setChallengeMode]       = useState<GameMode>("standard");
+  const [challengeDraftId, setChallengeDraftId] = useState<number | null>(null);
+  const [challengeDrafts, setChallengeDrafts]   = useState<{ id: number; name: string | null }[]>([]);
+  const [challengeLoading, setChallengeLoading] = useState(false);
+  const [challengeSent, setChallengeSent]       = useState(false);
 
   const handleFriend = useCallback(async () => {
     if (!viewerId || friendLoading) return;
@@ -601,6 +704,47 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
       setFollowLoading(false);
     }
   }, [viewerId, followLoading, profile.username]);
+
+  // Load drafts for the selected mode when challenge modal opens
+  const fetchChallengeDrafts = useCallback(async (mode: GameMode) => {
+    try {
+      const res = await fetch(`/api/drafts?mode=${mode}`);
+      if (res.ok) {
+        const data = await res.json();
+        setChallengeDrafts(data.drafts ?? []);
+      }
+    } catch { /* non-fatal */ }
+  }, []);
+
+  const handleOpenChallenge = useCallback((mode: GameMode) => {
+    setChallengeMode(mode);
+    setChallengeDraftId(null);
+    setChallengeSent(false);
+    fetchChallengeDrafts(mode);
+  }, [fetchChallengeDrafts]);
+
+  const handleSendChallenge = useCallback(async () => {
+    if (challengeLoading) return;
+    setChallengeLoading(true);
+    try {
+      const res = await apiFetch("/api/challenges", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          receiverId: profile.id,
+          mode:       challengeMode,
+          draftId:    challengeDraftId ?? undefined,
+        }),
+      });
+      if (res.ok) {
+        setChallengeSent(true);
+        // ChallengeDropdown owns its open state; challengeSent=true shows the
+        // success message inside the modal and it auto-closes via the component.
+      }
+    } finally {
+      setChallengeLoading(false);
+    }
+  }, [challengeLoading, profile.id, challengeMode, challengeDraftId]);
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "overview", label: "Overview" },
@@ -658,6 +802,21 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
                 friendStatus === "pending_received" ? "Accept Friend" :
                 "Add Friend"}
             </button>
+            {/* Challenge button — only between mutual friends */}
+            {friendStatus === "friends" && (
+              <ChallengeDropdown
+                profileId={profile.id}
+                challengeMode={challengeMode}
+                challengeDraftId={challengeDraftId}
+                challengeDrafts={challengeDrafts}
+                challengeLoading={challengeLoading}
+                challengeSent={challengeSent}
+                onOpen={handleOpenChallenge}
+                onModeChange={handleOpenChallenge}
+                onDraftChange={setChallengeDraftId}
+                onSend={handleSendChallenge}
+              />
+            )}
             {/* Follow button */}
             <button onClick={handleFollow} disabled={followLoading}
               className={`px-4 py-2 rounded-xl text-sm font-semibold border transition-all ${

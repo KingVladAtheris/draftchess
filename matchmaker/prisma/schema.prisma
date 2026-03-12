@@ -84,6 +84,8 @@ model User {
   followers         UserFollow[]       @relation("Following")
   sentRequests      FriendRequest[]    @relation("SentRequests")
   receivedRequests  FriendRequest[]    @relation("ReceivedRequests")
+  sentChallenges    GameChallenge[]    @relation("SentChallenges")
+  receivedChallenges GameChallenge[]   @relation("ReceivedChallenges")
   accounts          Account[]
   sessions          Session[]
 
@@ -109,6 +111,7 @@ model Draft {
   queuedByUsers User[] @relation("UserQueuedDraft")
   gamesAsDraft1 Game[] @relation("GameDraft1")
   gamesAsDraft2 Game[] @relation("GameDraft2")
+  challenges    GameChallenge[] @relation("ChallengeSenderDraft")
 
   @@index([userId])
   @@index([userId, mode])
@@ -149,6 +152,7 @@ model Game {
   player2EloAfter  Int?
   eloChange        Int?
   endReason        String?
+  isFriendGame     Boolean  @default(false)
 
   // PGN stored on finish for the replayer
   pgn              String?  @db.Text
@@ -352,4 +356,28 @@ model FriendRequest {
   @@index([senderId])
   @@index([receiverId])
   @@index([receiverId, status]) // fetch pending incoming requests efficiently
+}
+
+// ─── Friend Challenges ─────────────────────────────────────────────────────
+// A challenge is a direct game invitation between friends.
+// The resulting game has isFriendGame=true — no ELO is applied.
+// Status flow: pending → accepted | declined | cancelled | expired
+model GameChallenge {
+  id            Int      @id @default(autoincrement())
+  senderId      Int
+  receiverId    Int
+  mode          GameMode @default(standard)
+  senderDraftId Int?
+  status        String   @default("pending") // pending | accepted | declined | cancelled | expired
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime
+
+  sender      User   @relation("SentChallenges",       fields: [senderId],      references: [id], onDelete: Cascade)
+  receiver    User   @relation("ReceivedChallenges",   fields: [receiverId],    references: [id], onDelete: Cascade)
+  senderDraft Draft? @relation("ChallengeSenderDraft", fields: [senderDraftId], references: [id], onDelete: SetNull)
+
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([receiverId, status])
+  @@index([expiresAt])
 }

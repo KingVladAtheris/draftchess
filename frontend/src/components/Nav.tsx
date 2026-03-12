@@ -42,13 +42,24 @@ type DropdownItem =
   | { type: "button"; label: string; onClick: () => void; soon?: boolean; danger?: boolean }
   | { type: "divider" };
 
-type Notification = {
-  id:        string;
-  type:      "friend_request";
-  requestId: number;
-  sender:    { id: number; username: string; image: string | null };
-  createdAt: string;
-};
+type Notification =
+  | {
+      id:        string;
+      type:      "friend_request";
+      requestId: number;
+      sender:    { id: number; username: string; image: string | null };
+      createdAt: string;
+    }
+  | {
+      id:          string;
+      type:        "challenge";
+      challengeId: number;
+      mode:        string;
+      sender:      { id: number; username: string; image: string | null };
+      senderDraft: { id: number; name: string | null } | null;
+      createdAt:   string;
+      expiresAt:   string;
+    };
 
 // ─── Shared dropdown panel ───────────────────────────────────────────────────
 function DropdownPanel({ items, isOpen, align = "left" }: {
@@ -142,8 +153,12 @@ function NotificationsBell() {
     }
   }, []);
 
-  // Load on mount
+  // Load on mount + poll every 30s so challenges arrive without manual bell open
   useEffect(() => { fetchNotifications(); }, [fetchNotifications]);
+  useEffect(() => {
+    const id = setInterval(fetchNotifications, 30_000);
+    return () => clearInterval(id);
+  }, [fetchNotifications]);
 
   // Close on outside click
   useEffect(() => {
@@ -160,7 +175,7 @@ function NotificationsBell() {
     if (!open) fetchNotifications(); // refresh on open
   };
 
-  const handleAction = async (requestId: number, action: "accept" | "decline") => {
+  const handleFriendAction = async (requestId: number, action: "accept" | "decline") => {
     setActing(requestId);
     try {
       const res = await apiFetch(`/api/friends/${requestId}`, {
@@ -169,8 +184,33 @@ function NotificationsBell() {
         body:    JSON.stringify({ action }),
       });
       if (res.ok) {
-        setNotifications(prev => prev.filter(n => n.requestId !== requestId));
+        setNotifications(prev => prev.filter(n => !(n.type === "friend_request" && n.requestId === requestId)));
       }
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const handleChallengeAction = async (challengeId: number, action: "accept" | "decline") => {
+    setActing(challengeId);
+    try {
+      if (action === "decline") {
+        const res = await apiFetch(`/api/challenges/${challengeId}`, {
+          method:  "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ action: "decline" }),
+        });
+        if (res.ok) {
+          setNotifications(prev => prev.filter(n => !(n.type === "challenge" && n.challengeId === challengeId)));
+        }
+        return;
+      }
+      // Accept — find the notification to get the mode, then send to the
+      // select page so the acceptor can pick their draft before the game starts.
+      const notif = notifications.find(n => n.type === "challenge" && n.challengeId === challengeId);
+      const mode  = notif?.type === "challenge" ? notif.mode : "standard";
+      setNotifications(prev => prev.filter(n => !(n.type === "challenge" && n.challengeId === challengeId)));
+      window.location.href = `/play/${mode}?challengeId=${challengeId}`;
     } finally {
       setActing(null);
     }
@@ -213,36 +253,81 @@ function NotificationsBell() {
             {notifications.map(n => (
               <div key={n.id} className="px-4 py-3 border-b border-white/6 last:border-0">
                 <div className="flex items-start gap-3">
-                  <div className="w-8 h-8 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 text-xs font-bold flex-shrink-0">
+                  <div className={`w-8 h-8 rounded-full border flex items-center justify-center text-xs font-bold flex-shrink-0 ${
+                    n.type === "challenge"
+                      ? "bg-purple-500/20 border-purple-500/30 text-purple-400"
+                      : "bg-amber-500/20 border-amber-500/30 text-amber-400"
+                  }`}>
                     {n.sender.username[0].toUpperCase()}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm text-white/80 leading-snug">
-                      <Link
-                        href={`/profile/${n.sender.username}`}
-                        className="font-semibold hover:text-white transition-colors"
-                        onClick={() => setOpen(false)}
-                      >
-                        {n.sender.username}
-                      </Link>
-                      {" "}sent you a friend request
-                    </p>
-                    <div className="flex gap-2 mt-2">
-                      <button
-                        onClick={() => handleAction(n.requestId, "accept")}
-                        disabled={acting === n.requestId}
-                        className="px-3 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/25 transition-colors disabled:opacity-50"
-                      >
-                        {acting === n.requestId ? "…" : "Accept"}
-                      </button>
-                      <button
-                        onClick={() => handleAction(n.requestId, "decline")}
-                        disabled={acting === n.requestId}
-                        className="px-3 py-1 rounded-lg border border-white/10 text-white/40 text-xs font-semibold hover:border-white/20 hover:text-white/60 transition-colors disabled:opacity-50"
-                      >
-                        {acting === n.requestId ? "…" : "Decline"}
-                      </button>
-                    </div>
+                    {n.type === "friend_request" ? (
+                      <>
+                        <p className="text-sm text-white/80 leading-snug">
+                          <Link
+                            href={`/profile/${n.sender.username}`}
+                            className="font-semibold hover:text-white transition-colors"
+                            onClick={() => setOpen(false)}
+                          >
+                            {n.sender.username}
+                          </Link>
+                          {" "}sent you a friend request
+                        </p>
+                        <div className="flex gap-2 mt-2">
+                          <button
+                            onClick={() => handleFriendAction(n.requestId, "accept")}
+                            disabled={acting === n.requestId}
+                            className="px-3 py-1 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/25 transition-colors disabled:opacity-50"
+                          >
+                            {acting === n.requestId ? "…" : "Accept"}
+                          </button>
+                          <button
+                            onClick={() => handleFriendAction(n.requestId, "decline")}
+                            disabled={acting === n.requestId}
+                            className="px-3 py-1 rounded-lg border border-white/10 text-white/40 text-xs font-semibold hover:border-white/20 hover:text-white/60 transition-colors disabled:opacity-50"
+                          >
+                            {acting === n.requestId ? "…" : "Decline"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-sm text-white/80 leading-snug">
+                          <Link
+                            href={`/profile/${n.sender.username}`}
+                            className="font-semibold hover:text-white transition-colors"
+                            onClick={() => setOpen(false)}
+                          >
+                            {n.sender.username}
+                          </Link>
+                          {" "}challenged you to a{" "}
+                          <span className={`font-semibold ${
+                            n.mode === "royal" ? "text-purple-400" : n.mode === "pauper" ? "text-sky-400" : "text-amber-400"
+                          }`}>
+                            {n.mode}
+                          </span>
+                          {" "}game
+                          {n.senderDraft?.name ? ` with "${n.senderDraft.name}"` : ""}
+                        </p>
+                        <p className="text-[10px] text-white/25 mt-0.5">No ELO impact · casual</p>
+                        <div className="flex gap-2 mt-2">
+                          <button
+                            onClick={() => handleChallengeAction(n.challengeId, "accept")}
+                            disabled={acting === n.challengeId}
+                            className="px-3 py-1 rounded-lg bg-purple-500/15 border border-purple-500/30 text-purple-400 text-xs font-semibold hover:bg-purple-500/25 transition-colors disabled:opacity-50"
+                          >
+                            {acting === n.challengeId ? "…" : "Accept"}
+                          </button>
+                          <button
+                            onClick={() => handleChallengeAction(n.challengeId, "decline")}
+                            disabled={acting === n.challengeId}
+                            className="px-3 py-1 rounded-lg border border-white/10 text-white/40 text-xs font-semibold hover:border-white/20 hover:text-white/60 transition-colors disabled:opacity-50"
+                          >
+                            {acting === n.challengeId ? "…" : "Decline"}
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -344,7 +429,13 @@ function usePresence(isLoggedIn: boolean) {
   useEffect(() => {
     if (!isLoggedIn) return;
     import("@/app/lib/socket").then(({ getSocket }) => {
-      getSocket().catch(() => {}); // connect — heartbeat starts on the 'connect' event
+      getSocket().then(socket => {
+        // Redirect challenger when their challenge gets accepted
+        socket.off("challenge-accepted");
+        socket.on("challenge-accepted", ({ gameId }: { gameId: number }) => {
+          window.location.href = `/play/game/${gameId}`;
+        });
+      }).catch(() => {}); // connect — heartbeat starts on 'connect' event
     });
   }, [isLoggedIn]);
 }

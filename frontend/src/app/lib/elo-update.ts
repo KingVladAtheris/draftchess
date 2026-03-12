@@ -46,7 +46,39 @@ export async function updateGameResult(
   player2Games:     number,
   endReason:        string,
   mode:             GameMode = "standard",
+  isFriendGame:     boolean,
 ): Promise<{ newPlayer1Elo: number; newPlayer2Elo: number; eloChange: number } | null> {
+
+  // Friend games: mark finished, clear queue state, but skip ELO + stats.
+  if (isFriendGame) {
+    try {
+      await prisma.$transaction(async (tx) => {
+        const guard = await tx.game.updateMany({
+          where: { id: gameId, status: "active" },
+          data:  { status: "finished" },
+        });
+        if (guard.count === 0) throw new AlreadyFinishedError();
+        await tx.game.update({
+          where: { id: gameId },
+          data:  { winnerId: winnerId ?? undefined, endReason },
+        });
+        for (const uid of [player1Id, player2Id]) {
+          await tx.user.update({
+            where: { id: uid },
+            data:  { queueStatus: "offline", queuedAt: null, queuedDraftId: null, queuedMode: null },
+          });
+        }
+      });
+    } catch (err) {
+      if (err instanceof AlreadyFinishedError) {
+        console.warn(`updateGameResult: game ${gameId} already finished, skipping`);
+        return null;
+      }
+      throw err;
+    }
+    // Return the unchanged ELOs so callers can broadcast without crashing.
+    return { newPlayer1Elo: player1EloBefore, newPlayer2Elo: player2EloBefore, eloChange: 0 };
+  }
 
   const isDraw = winnerId === null;
 

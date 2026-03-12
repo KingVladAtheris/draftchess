@@ -31,6 +31,7 @@ export async function POST(
       id: true, status: true,
       player1Id: true, player2Id: true,
       mode: true,
+      isFriendGame: true,
       player1EloBefore: true, player2EloBefore: true,
       player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
       player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
@@ -58,7 +59,8 @@ export async function POST(
     game.player1Id, game.player2Id,
     game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
     game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
-    "resignation", gameMode
+    "resignation", gameMode,
+    game.isFriendGame === true
   );
 
   if (result) {

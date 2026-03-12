@@ -60,9 +60,9 @@ function DraftOption({ draft, selected, disabled, onSelect, budget, mode }: {
   );
 }
 
-function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave, budget, mode }: {
+function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave, budget, mode, isChallengeMode }: {
   selectedDraft: Draft | null; isQueuing: boolean; onQueue: () => void; onLeave: () => void;
-  budget: number; mode: GameMode;
+  budget: number; mode: GameMode; isChallengeMode?: boolean;
 }) {
   const [elapsed, setElapsed] = useState(0);
   const startRef = useRef<number | null>(null);
@@ -115,7 +115,7 @@ function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave, budget, mode }
         <button onClick={onLeave} className="btn-danger w-full py-3">Leave Queue</button>
       ) : (
         <button onClick={onQueue} disabled={!selectedDraft} className="btn-primary w-full py-3 disabled:opacity-40 disabled:cursor-not-allowed">
-          Find a match
+          {isChallengeMode ? "Accept Challenge" : "Find a match"}
         </button>
       )}
 
@@ -126,16 +126,20 @@ function QueuePanel({ selectedDraft, isQueuing, onQueue, onLeave, budget, mode }
   );
 }
 
-export default function SelectClient({ drafts, mode, budget }: {
+export default function SelectClient({ drafts, mode, budget, isChallengeMode = false, challengeId = null }: {
   drafts: Draft[];
   mode:   GameMode;
   budget: number;
+  isChallengeMode?: boolean;
+  challengeId?: string | null;
 }) {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [isQueuing, setIsQueuing]   = useState(false);
   const [error, setError]           = useState<string | null>(null);
   const didLeaveRef                 = useRef(false);
   const isQueuingRef                = useRef(false);
+
+  
 
   useEffect(() => { isQueuingRef.current = isQueuing; }, [isQueuing]);
 
@@ -188,6 +192,21 @@ export default function SelectClient({ drafts, mode, budget }: {
       });
       if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to join queue"); }
       didLeaveRef.current = false; setIsQueuing(true); attachSocket();
+    } catch (e: any) { setError(e.message); }
+  };
+
+  const handleChallengeAccept = async () => {
+    if (!selectedId || !challengeId) return;
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/challenges/${challengeId}`, {
+        method:  "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ action: "accept", draftId: selectedId }),
+      });
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error || "Failed to accept challenge"); }
+      const data = await res.json();
+      if (data.gameId) window.location.href = `/play/game/${data.gameId}`;
     } catch (e: any) { setError(e.message); }
   };
 
@@ -245,10 +264,11 @@ export default function SelectClient({ drafts, mode, budget }: {
           <QueuePanel
             selectedDraft={drafts.find(d => d.id === selectedId) ?? null}
             isQueuing={isQueuing}
-            onQueue={handleQueue}
+            onQueue={isChallengeMode ? handleChallengeAccept : handleQueue}
             onLeave={handleLeave}
             budget={budget}
             mode={mode}
+            isChallengeMode={isChallengeMode}
           />
         </div>
       </div>

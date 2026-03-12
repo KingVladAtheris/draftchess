@@ -71,6 +71,7 @@ export async function POST(
       player2Id: true,
       whitePlayerId: true,
       mode: true,
+      isFriendGame: true,
       player1EloBefore: true,
       player2EloBefore: true,
       lastMoveAt: true,
@@ -122,7 +123,8 @@ export async function POST(
       game.player1Id, game.player2Id,
       game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
       game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
-      "timeout", gameMode
+      "timeout", gameMode,
+      game.isFriendGame === true
     );
 
     if (result) {
@@ -213,7 +215,8 @@ export async function POST(
       game.player1Id, game.player2Id,
       game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
       game.player1[gamesField2] ?? 0, game.player2[gamesField2] ?? 0,
-      endReason, gameMode2
+      endReason, gameMode2,
+      game.isFriendGame === true
     );
   }
 

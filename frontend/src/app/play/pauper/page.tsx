@@ -5,7 +5,11 @@ import { redirect } from "next/navigation";
 import SelectClient from "@/app/play/select/SelectClient";
 import { MODE_CONFIG } from "@/app/lib/game-modes";
 
-export default async function PlayPauperPage() {
+export default async function PlayPauperPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ challengeId?: string }>;
+}) {
   const session = await auth();
   if (!session?.user?.id) redirect("/login");
   const userId = parseInt(session.user.id);
@@ -16,6 +20,7 @@ export default async function PlayPauperPage() {
     orderBy: { updatedAt: "desc" },
     select:  { id: true, name: true, points: true, updatedAt: true },
   });
+  const { challengeId } = await searchParams;
 
-  return <SelectClient drafts={drafts} mode="pauper" budget={cfg.draftBudget} />;
+  return <SelectClient drafts={drafts} mode="pauper" budget={cfg.draftBudget} isChallengeMode={!!challengeId} challengeId={challengeId ?? null}/>;
 }

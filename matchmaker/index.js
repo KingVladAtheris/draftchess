@@ -106,7 +106,34 @@ function calculateEloChange(winnerElo, loserElo, winnerGames, isDraw = false) {
 }
 
 async function finalizeGame(gameId, winnerId, player1Id, player2Id,
-                             p1EloBefore, p2EloBefore, p1Games, p2Games, endReason, mode = 'standard') {
+                             p1EloBefore, p2EloBefore, p1Games, p2Games, endReason, mode = 'standard', isFriendGame = false) {
+
+  // Friend games: mark finished and clear queue state, but skip ELO / stat updates.
+  if (isFriendGame) {
+    let finalized = false;
+    try {
+      await prisma.$transaction(async (tx) => {
+        const guard = await tx.game.updateMany({
+          where: { id: gameId, status: 'active' },
+          data:  { status: 'finished' },
+        });
+        if (guard.count === 0) return;
+        await tx.game.update({
+          where: { id: gameId },
+          data:  { winnerId: winnerId ?? undefined, endReason },
+        });
+        const queueReset = { queueStatus: 'offline', queuedAt: null, queuedDraftId: null, queuedMode: null };
+        await tx.user.update({ where: { id: player1Id }, data: queueReset });
+        await tx.user.update({ where: { id: player2Id }, data: queueReset });
+        finalized = true;
+      });
+    } catch (err) {
+      logger.error(`[finalizeGame] game ${gameId} (friend) transaction error:`, err.message);
+      throw err;
+    }
+    return finalized ? { newP1Elo: p1EloBefore, newP2Elo: p2EloBefore, eloChange: 0 } : null;
+  }
+
   const isDraw = winnerId === null;
   let p1Change, p2Change;
 
@@ -392,7 +419,7 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
   const game = await prisma.game.findUnique({
     where:  { id: gameId },
     select: {
-      id: true, status: true, fen: true, mode: true,
+      id: true, status: true, fen: true, mode: true, isFriendGame: true,
       player1Id: true, player2Id: true, whitePlayerId: true,
       lastMoveAt: true, player1Timebank: true, player2Timebank: true,
       player1EloBefore: true, player2EloBefore: true,
@@ -441,7 +468,7 @@ const timeoutWorker = new Worker('timeout-queue', async (job) => {
     game.player1Id, game.player2Id,
     game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
     game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
-    'timeout', gameMode
+    'timeout', gameMode, game.isFriendGame ?? false
   );
 
   if (!result) {
@@ -474,7 +501,7 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
       lastMoveAt: { lt: staleCutoff },
     },
     select: {
-      id: true, fen: true, lastMoveAt: true, mode: true,
+      id: true, fen: true, lastMoveAt: true, mode: true, isFriendGame: true,
       player1Id: true, player2Id: true, whitePlayerId: true,
       player1Timebank: true, player2Timebank: true,
       player1EloBefore: true, player2EloBefore: true,
@@ -510,7 +537,7 @@ const reconcileWorker = new Worker('reconcile-queue', async (_job) => {
         game.player1Id, game.player2Id,
         game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
         game.player1[rGamesField] ?? 0, game.player2[rGamesField] ?? 0,
-        'timeout', rMode
+        'timeout', rMode, game.isFriendGame ?? false
       );
 
       if (result) {
